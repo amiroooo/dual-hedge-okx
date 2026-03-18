@@ -1,4 +1,4 @@
-import axios, { Method } from 'axios';
+import axios from 'axios';
 import * as crypto from 'crypto';
 import * as dotenv from 'dotenv';
 
@@ -14,7 +14,7 @@ const API_KEY = process.env.OKX_API_KEY as string;
 const API_SECRET = process.env.OKX_API_SECRET as string;
 const API_PASSPHRASE = process.env.OKX_API_PASSPHRASE as string;
 const IS_SIMULATED = process.env.OKX_TEST;
-const gridPercentRange = Number(process.env.OKX_GRID_PERCENTAGE_RANGE) || 0.05; 
+const gridPercentRange = Number(process.env.OKX_GRID_PERCENTAGE_RANGE) || 0.10;
 
 const BASE_URL = 'https://www.okx.com';
 
@@ -27,24 +27,24 @@ if (args.length < 3) {
     process.exit(1);
 }
 
-const SYMBOL = args[0];                      
-const LEVERAGE = parseInt(args[1], 10);      
-const MARGIN_USDT = parseFloat(args[2]);     
+const SYMBOL = args[0];
+const LEVERAGE = parseInt(args[1], 10);
+const MARGIN_USDT = parseFloat(args[2]);
 
 // Target Profit Config
-const TARGET_PROFIT_USDT = 0.15; 
+const TARGET_PROFIT_USDT = 0.15;
 
 // ==========================================
 // 2. OKX API CORE FUNCTIONS
 // ==========================================
-async function okxRequest(method: Method, endpoint: string, bodyObj: any = null) {
+async function okxRequest(method: string, endpoint: string, bodyObj: any = null) {
     const timestamp = new Date().toISOString();
     const bodyStr = bodyObj ? JSON.stringify(bodyObj) : '';
-    
+
     const preHash = timestamp + method.toUpperCase() + endpoint + bodyStr;
     const signature = crypto.createHmac('sha256', API_SECRET).update(preHash).digest('base64');
 
-    const headers = {
+    const headers: Record<string, string> = {
         'OK-ACCESS-KEY': API_KEY,
         'OK-ACCESS-SIGN': signature,
         'OK-ACCESS-TIMESTAMP': timestamp,
@@ -78,7 +78,7 @@ async function deployDualGrids() {
     const balRes = await okxRequest('GET', '/api/v5/account/balance');
     const usdtDetails = balRes.data[0].details.find((d: any) => d.ccy === 'USDT');
     const availBal = usdtDetails ? parseFloat(usdtDetails.availBal) : 0;
-    
+
     if (availBal < (MARGIN_USDT * 2)) {
         console.error(`\n❌ Insufficient Balance: You have $${availBal.toFixed(2)} USDT.`);
         console.error(`   You need at least $${MARGIN_USDT * 2} USDT to deploy both bots.`);
@@ -93,14 +93,14 @@ async function deployDualGrids() {
         process.exit(1);
     }
     const instrument = instRes.data[0];
-    const ctVal = parseFloat(instrument.ctVal); 
-    const tickSz = instrument.tickSz;           
+    const ctVal = parseFloat(instrument.ctVal);
+    const tickSz = instrument.tickSz;
     const tickDecimals = tickSz.includes('.') ? tickSz.split('.')[1].length : 0;
 
     // 3. Get Current Price
     const tickerRes = await okxRequest('GET', `/api/v5/market/ticker?instId=${SYMBOL}`);
     const currentPrice = parseFloat(tickerRes.data[0].last);
-    
+
     // 4. Calculate Total Contracts based on USDT margin
     const notionalValue = MARGIN_USDT * LEVERAGE;
     const contractValueUSDT = currentPrice * ctVal;
@@ -118,34 +118,33 @@ async function deployDualGrids() {
     const minPx = currentPrice * (1 - gridPercentRange);
     const gridRange = maxPx - minPx;
 
-    // 6. Calculate Grid Number Based on TARGET PROFIT (0.15 USDT)
-    // Formula derivation: gridNum = sqrt((totalContracts * ctVal * gridRange) / TargetProfit)
-    const rawGridNum = (totalContracts * ctVal * gridRange) / TARGET_PROFIT_USDT;
-    
-    // Constraints: 
-    // - OKX Minimum is 2 grids.
-    // - OKX Maximum is usually 150 grids.
-    // - You cannot have more grids than total contracts (minimum 1 contract per grid requirement).
-    const gridNum = Math.max(2, Math.min(Math.floor(rawGridNum), 150));
+    // 6. Calculate Grid Number Based on Geometric Profit Limits
+    // OKX Fees max out at ~0.1% round trip for VIP0 limits (0.05% taker * 2). We set minimum buffer to 0.12%.
+    const FEE_THRESHOLD = 0.0012 * 2;
+    let gridNum = 150;
 
-    // Calculate the expected profit dynamically to show to the user
-    const expectedProfitPerGrid = (totalContracts / gridNum) * ctVal * (gridRange / gridNum);
+    // Geometric grid ratio: (maxPx / minPx) ^ (1 / gridNum)
+    let expectedProfitPerGrid = Math.pow(maxPx / minPx, 1 / gridNum) - 1;
+
+    // Step down grid number until we find one that is safely above the fee threshold, down to 75.
+    while (gridNum > 75 && expectedProfitPerGrid <= FEE_THRESHOLD) {
+        gridNum--;
+        expectedProfitPerGrid = Math.pow(maxPx / minPx, 1 / gridNum) - 1;
+    }
+
+    if (expectedProfitPerGrid <= 0.001) { // Hard fail if below 0.1%
+        console.error(`\n❌ Calculated Grid Profit (${(expectedProfitPerGrid * 100).toFixed(3)}%) is less than expected round-trip fees (~0.1%).`);
+        console.error(`   Decrease Max grids or widen percentage range. Aborting.`);
+        process.exit(1);
+    }
 
     console.log(`\n📐 Calculated Trade Sizes:`);
     console.log(`   Contract Size: 1 contract = ${ctVal} ${SYMBOL.split('-')[0]}`);
-    console.log(`   Total Contracts per Bot: ${totalContracts}`);
-    console.log(`   Target Profit Config: $${TARGET_PROFIT_USDT} USDT`);
     console.log(`   Automatically Selected Grids: ${gridNum}`);
-    console.log(`   Expected Gross Profit per Grid: ~$${expectedProfitPerGrid.toFixed(4)} USDT`);
-    
-    if (gridNum === totalContracts && expectedProfitPerGrid > (TARGET_PROFIT_USDT * 1.5)) {
-        console.log(`   ⚠️ Note: Your required profit calculated ${Math.floor(rawGridNum)} grids, but OKX requires at least 1 contract per grid. Grids were capped at ${totalContracts}.`);
-    } else if (gridNum === 150) {
-        console.log(`   ⚠️ Note: Grids were capped at the exchange maximum of 150.`);
-    }
+    console.log(`   Expected Return per Grid Step: ${(expectedProfitPerGrid * 100).toFixed(3)}%`);
 
     // 7. Calculate TP and SL (80% buffer distance outside grid)
-    const bufferDistance = gridRange * 0.8; 
+    const bufferDistance = gridRange * 0.95;
     const longSL = minPx - bufferDistance;
     const longTP = maxPx + bufferDistance;
     const shortSL = maxPx + bufferDistance;
@@ -153,22 +152,46 @@ async function deployDualGrids() {
 
     // 8. Bot Creation Function
     const createBot = async (direction: 'long' | 'short', sl: number, tp: number) => {
+        // First check minimum margin requirement before placing!
+        const minInvestRes = await okxRequest('POST', '/api/v5/tradingBot/grid/min-investment', {
+            instId: SYMBOL,
+            algoOrdType: 'contract_grid',
+            runType: '2', // 2 = Geometric
+            maxPx: maxPx.toFixed(tickDecimals),
+            minPx: minPx.toFixed(tickDecimals),
+            gridNum: gridNum.toString(),
+            direction: direction,
+            lever: LEVERAGE.toString()
+        });
+
+        if (minInvestRes.code !== '0') {
+            console.error(`\n❌ Failed to get min investment for ${direction.toUpperCase()} Bot:`, minInvestRes.msg);
+            process.exit(1);
+        }
+
+        const minMarginRequired = parseFloat(minInvestRes.data[0].minInvestmentData[0].amt);
+        if (MARGIN_USDT < minMarginRequired) {
+            console.error(`\n❌ Insufficient Margin input for ${direction.toUpperCase()} Grid! Required: $${minMarginRequired.toFixed(2)} USDT, Provided: $${MARGIN_USDT} USDT`);
+            console.error(`   Increase margin or decrease Grids. Aborting.`);
+            process.exit(1);
+        }
+
         const payload = {
             instId: SYMBOL,
             algoOrdType: 'contract_grid',
-            maxPx: maxPx.toFixed(tickDecimals), 
+            maxPx: maxPx.toFixed(tickDecimals),
             minPx: minPx.toFixed(tickDecimals),
             gridNum: gridNum.toString(),
-            runType: '1',            // 1 = Arithmetic
+            runType: '2',            // 2 = Geometric
             direction: direction,
             lever: LEVERAGE.toString(),
-            sz: MARGIN_USDT.toString(),           
+            sz: MARGIN_USDT.toString(),
             slTriggerPx: sl.toFixed(tickDecimals),
             tpTriggerPx: tp.toFixed(tickDecimals)
         };
 
         const res = await okxRequest('POST', '/api/v5/tradingBot/grid/order-algo', payload);
-        
+
         if (res.code === '0') {
             console.log(`\n✅ ${direction.toUpperCase()} Bot Created Successfully!`);
             console.log(`   ID: ${res.data[0].algoId}`);

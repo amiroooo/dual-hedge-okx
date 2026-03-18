@@ -3,6 +3,7 @@
   "version": "2026.3.1",
   "description": "Dual-hedged futures grid strategy with atomic kill switch for Binance",
   "main": "index.ts",
+  "type": "module",
   "scripts": {
     "start": "tsx --inspect-brk dual-grid.ts BTC-USDT-SWAP 5 400",
     "build": "tsc",
