@@ -124,9 +124,14 @@ async function deployDualGrids() {
     const tickSz = instrument.tickSz;
     const tickDecimals = tickSz.includes('.') ? tickSz.split('.')[1].length : 0;
 
-    // 3. Get Current Price
+    // 3. Get Current Price and Funding Rate
     const tickerRes = await okxRequest('GET', `/api/v5/market/ticker?instId=${SYMBOL}`);
     const currentPrice = parseFloat(tickerRes.data[0].last);
+
+    const fundingRes = await okxRequest('GET', `/api/v5/public/funding-rate?instId=${SYMBOL}`);
+    const currentFundingRate = fundingRes.data && fundingRes.data.length > 0
+        ? parseFloat(fundingRes.data[0].fundingRate) * 100
+        : 0;
 
     // 4. Calculate Total Contracts based on USDT margin
     const notionalValue = MARGIN_USDT * LEVERAGE;
@@ -209,7 +214,7 @@ async function deployDualGrids() {
     console.log(`\n========================================`);
     console.log(`         DEPLOYMENT SUMMARY (${IS_SIMULATED ? 'DEMO' : 'LIVE'})        `);
     console.log(`========================================`);
-    console.log(` Pair:              ${SYMBOL}`);
+    console.log(` Pair:              ${SYMBOL} (Funding Rate: ${currentFundingRate.toFixed(5)}%)`);
     console.log(` Leverage:          ${LEVERAGE}x (Isolated)`);
     console.log(` Margin per Bot:    $${MARGIN_USDT} USDT`);
     console.log(` Min Required:      $${minMarginRequired.toFixed(2)} USDT`);
