@@ -1,19 +1,32 @@
 import axios from 'axios';
 import * as crypto from 'crypto';
 import * as dotenv from 'dotenv';
+import * as readline from 'readline';
 
 dotenv.config();
 
-// npx ts-node dual-grid.ts BTC-USDT-SWAP 10 250
+function askConfirmation(query: string): Promise<boolean> {
+    const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
+    });
+    return new Promise((resolve) => rl.question(query, (ans) => {
+        rl.close();
+        resolve(ans.toLowerCase() === 'y' || ans.toLowerCase() === 'yes');
+    }));
+}
+
+// npm start NEAR-USDT-SWAP 10 200 
 // npx ts-node dual-grid.ts DOGE-USDT-SWAP 20 50
 
 // ==========================================
 // 1. CONFIGURATION & SETUP
 // ==========================================
-const API_KEY = process.env.OKX_API_KEY as string;
-const API_SECRET = process.env.OKX_API_SECRET as string;
+const IS_SIMULATED = process.env.OKX_TEST === 'true';
+const API_KEY = IS_SIMULATED ? process.env.OKX_API_KEY_TEST as string : process.env.OKX_API_KEY_LIVE as string;
+const API_SECRET = IS_SIMULATED ? process.env.OKX_API_SECRET_TEST as string : process.env.OKX_API_SECRET_LIVE as string;
 const API_PASSPHRASE = process.env.OKX_API_PASSPHRASE as string;
-const IS_SIMULATED = process.env.OKX_TEST;
+
 const gridPercentRange = Number(process.env.OKX_GRID_PERCENTAGE_RANGE) || 0.10;
 
 const BASE_URL = 'https://www.okx.com';
@@ -51,7 +64,7 @@ async function okxRequest(method: string, endpoint: string, bodyObj: any = null)
         'OK-ACCESS-PASSPHRASE': API_PASSPHRASE,
         'Content-Type': 'application/json',
     };
-    if (IS_SIMULATED === 'true') {
+    if (IS_SIMULATED) {
         headers['x-simulated-trading'] = '1';
     }
 
@@ -158,37 +171,63 @@ async function deployDualGrids() {
     console.log(`   Expected Return per Grid Step: ${(expectedProfitPerGrid * 100).toFixed(3)}%`);
 
     // 7. Calculate TP and SL (80% buffer distance outside grid)
-    const bufferDistance = gridRange * 0.95;
+    const bufferDistance = gridRange * 0.8;
     const longSL = minPx - bufferDistance;
     const longTP = maxPx + bufferDistance;
     const shortSL = maxPx + bufferDistance;
     const shortTP = minPx - bufferDistance;
 
-    // 8. Bot Creation Function
+    // 8. Pre-flight Margin Verification (Check OKX Minimum Investment)
+    console.log(`\n⚙️ Validating Margin Requirements...`);
+    const minInvestRes = await okxRequest('POST', '/api/v5/tradingBot/grid/min-investment', {
+        instId: SYMBOL,
+        algoOrdType: 'contract_grid',
+        runType: '2', // 2 = Geometric
+        maxPx: maxPx.toFixed(tickDecimals),
+        minPx: minPx.toFixed(tickDecimals),
+        gridNum: gridNum.toString(),
+        direction: 'long',
+        lever: LEVERAGE.toString()
+    });
+
+    if (minInvestRes.code !== '0') {
+        console.error(`\n❌ Failed to calculate minimum investment from OKX API:`, minInvestRes.msg);
+        process.exit(1);
+    }
+
+    const minMarginRequired = parseFloat(minInvestRes.data[0].minInvestmentData[0].amt);
+    if (MARGIN_USDT < minMarginRequired) {
+        console.error(`\n❌ Insufficient Margin Allocation!`);
+        console.error(`   Required minimum by OKX for these grid settings is: $${minMarginRequired.toFixed(2)} USDT per Bot.`);
+        console.error(`   You only allocated: $${MARGIN_USDT} USDT per Bot.`);
+        console.error(`   Please increase margin or decrease the number of Grids. Aborting.`);
+        process.exit(1);
+    }
+    console.log(`✅ Margin check passed. Minimum required: $${minMarginRequired.toFixed(2)} USDT, Provided: $${MARGIN_USDT} USDT.`);
+
+    // 9. Confirmation Prompt
+    console.log(`\n========================================`);
+    console.log(`         DEPLOYMENT SUMMARY (${IS_SIMULATED ? 'DEMO' : 'LIVE'})        `);
+    console.log(`========================================`);
+    console.log(` Pair:              ${SYMBOL}`);
+    console.log(` Leverage:          ${LEVERAGE}x (Isolated)`);
+    console.log(` Margin per Bot:    $${MARGIN_USDT} USDT`);
+    console.log(` Min Required:      $${minMarginRequired.toFixed(2)} USDT`);
+    console.log(` Total Margin:      $${MARGIN_USDT * 2} USDT`);
+    console.log(` Grids per Bot:     ${gridNum} (Geometric)`);
+    console.log(` Step Profit:       ${(expectedProfitPerGrid * 100).toFixed(3)}%`);
+    console.log(` Long Bot SL:       $${longSL.toFixed(tickDecimals)}`);
+    console.log(` Short Bot SL:      $${shortSL.toFixed(tickDecimals)}`);
+    console.log(`========================================`);
+
+    const confirmed = await askConfirmation(`\nDeploy these dual bots on OKX? [y/N]: `);
+    if (!confirmed) {
+        console.log(`\n❌ Deployment aborted by user.`);
+        process.exit(0);
+    }
+
+    // 10. Bot Creation Function
     const createBot = async (direction: 'long' | 'short', sl: number, tp: number) => {
-        // First check minimum margin requirement before placing!
-        const minInvestRes = await okxRequest('POST', '/api/v5/tradingBot/grid/min-investment', {
-            instId: SYMBOL,
-            algoOrdType: 'contract_grid',
-            runType: '2', // 2 = Geometric
-            maxPx: maxPx.toFixed(tickDecimals),
-            minPx: minPx.toFixed(tickDecimals),
-            gridNum: gridNum.toString(),
-            direction: direction,
-            lever: LEVERAGE.toString()
-        });
-
-        if (minInvestRes.code !== '0') {
-            console.error(`\n❌ Failed to get min investment for ${direction.toUpperCase()} Bot:`, minInvestRes.msg);
-            process.exit(1);
-        }
-
-        const minMarginRequired = parseFloat(minInvestRes.data[0].minInvestmentData[0].amt);
-        if (MARGIN_USDT < minMarginRequired) {
-            console.error(`\n❌ Insufficient Margin input for ${direction.toUpperCase()} Grid! Required: $${minMarginRequired.toFixed(2)} USDT, Provided: $${MARGIN_USDT} USDT`);
-            console.error(`   Increase margin or decrease Grids. Aborting.`);
-            process.exit(1);
-        }
 
         const payload = {
             instId: SYMBOL,
@@ -216,7 +255,9 @@ async function deployDualGrids() {
         }
     };
 
-    // 9. Execute Deployments
+
+
+    // 10. Execute Deployments
     console.log(`\n⚙️ Firing Off Bot API Calls...`);
     await createBot('long', longSL, longTP);
     await createBot('short', shortSL, shortTP);
