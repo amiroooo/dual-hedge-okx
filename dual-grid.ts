@@ -15,7 +15,7 @@ function askConfirmation(query: string): Promise<boolean> {
         resolve(ans.toLowerCase() === 'y' || ans.toLowerCase() === 'yes');
     }));
 }
-
+//           PAIR           LEVERAGE      MARGIN_USDT_PER_ONE_BOT (2x of that in total)
 // npm start NEAR-USDT-SWAP 10 200 
 // npx ts-node dual-grid.ts DOGE-USDT-SWAP 20 50
 
@@ -35,14 +35,15 @@ const BASE_URL = 'https://www.okx.com';
 const args = process.argv.slice(2);
 if (args.length < 3) {
     console.error('❌ Error: Missing arguments.');
-    console.error('Usage: npx ts-node dual-grid.ts <PAIR> <LEVERAGE> <MARGIN_USDT_PER_BOT>');
-    console.error('Example (BTC, 10x Lev, 100 USDT per bot): npx ts-node dual-grid.ts BTC-USDT-SWAP 10 100');
+    console.error('Usage: npx ts-node dual-grid.ts <PAIR> <LEVERAGE> <MARGIN_USDT_PER_BOT> [EXTRA_MARGIN_USDT_PER_BOT]');
+    console.error('Example (BTC, 10x Lev, 100 USDT base, 50 USDT padding): npx ts-node dual-grid.ts BTC-USDT-SWAP 10 100 50');
     process.exit(1);
 }
 
 const SYMBOL = args[0];
 const LEVERAGE = parseInt(args[1], 10);
 const MARGIN_USDT = parseFloat(args[2]);
+const EXTRA_MARGIN_USDT = args[3] ? parseFloat(args[3]) : 0;
 
 // Target Profit Config
 const TARGET_PROFIT_USDT = 0.15;
@@ -106,9 +107,10 @@ async function deployDualGrids() {
     const usdtDetails = balRes.data[0].details.find((d: any) => d.ccy === 'USDT');
     const availBal = usdtDetails ? parseFloat(usdtDetails.availBal) : 0;
 
-    if (availBal < (MARGIN_USDT * 2)) {
+    const TOTAL_WALLET_REQUIRED = (MARGIN_USDT + EXTRA_MARGIN_USDT) * 2;
+    if (availBal < TOTAL_WALLET_REQUIRED) {
         console.error(`\n❌ Insufficient Balance: You have $${availBal.toFixed(2)} USDT.`);
-        console.error(`   You need at least $${MARGIN_USDT * 2} USDT to deploy both bots.`);
+        console.error(`   You need at least $${TOTAL_WALLET_REQUIRED} USDT to deploy both bots (with safety padding).`);
         process.exit(1);
     }
     console.log(`✅ Balance OK. Available: $${availBal.toFixed(2)} USDT`);
@@ -175,12 +177,63 @@ async function deployDualGrids() {
     console.log(`   Automatically Selected Grids: ${gridNum}`);
     console.log(`   Expected Return per Grid Step: ${(expectedProfitPerGrid * 100).toFixed(3)}%`);
 
-    // 7. Calculate TP and SL (80% buffer distance outside grid)
-    const bufferDistance = gridRange * 0.8;
+    // 7. Calculate TP and SL (20% buffer distance outside grid)
+    const bufferDistance = gridRange * 0.2;
     const longSL = minPx - bufferDistance;
     const longTP = maxPx + bufferDistance;
     const shortSL = maxPx + bufferDistance;
     const shortTP = minPx - bufferDistance;
+
+    // 7.5. Evaluate Liquidation Safety vs Stop Loss
+    // Calculate estimated average entry for fully localized grids
+    const avgEntryLong = (currentPrice + minPx) / 2;
+    const avgEntryShort = (currentPrice + maxPx) / 2;
+
+    // Estimated liquidation drops by ~ (1 / Leverage) from average entry
+    // We calculate "Effective Leverage" mathematically in case you supply injection safety funds
+    const effectiveLeverage = notionalValue / (MARGIN_USDT + EXTRA_MARGIN_USDT);
+    const estLiqLong = avgEntryLong * (1 - (1 / effectiveLeverage));
+    const estLiqShort = avgEntryShort * (1 + (1 / effectiveLeverage));
+
+    // Ensure the liquidation price is at least 20% FURTHER away than the SL.
+    // For a Long: Liquidation MUST be < SL * 0.80
+    // For a Short: Liquidation MUST be > SL * 1.20
+    const reqLiqLong = longSL * 0.90;
+    const reqLiqShort = shortSL * 1.10;
+
+    if (estLiqLong > reqLiqLong || estLiqShort < reqLiqShort) {
+        console.error(`\n❌ HIGH LIQUIDATION RISK DETECTED:`);
+        console.error(`   Estimated Long Liquidation: $${estLiqLong.toFixed(tickDecimals)}`);
+        console.error(`   Required Long Liquidation (20% below SL $${longSL.toFixed(tickDecimals)}): $${reqLiqLong.toFixed(tickDecimals)}`);
+        console.error(`   --`);
+        console.error(`   Estimated Short Liquidation: $${estLiqShort.toFixed(tickDecimals)}`);
+        console.error(`   Required Short Liquidation (20% above SL $${shortSL.toFixed(tickDecimals)}): $${reqLiqShort.toFixed(tickDecimals)}`);
+        console.error(`\n   Your leverage is too high for this grid range/SL! The bot will be liquidated before safely hitting the SL.`);
+
+        const safeLevLong = (reqLiqLong < avgEntryLong) ? 1 / (1 - (reqLiqLong / avgEntryLong)) : 100;
+        const safeLevShort = (reqLiqShort > avgEntryShort) ? 1 / ((reqLiqShort / avgEntryShort) - 1) : 100;
+        const maxSafeLeverage = Math.floor(Math.min(safeLevLong, safeLevShort));
+
+        if (maxSafeLeverage >= 1) {
+            const requiredTotalMargin = notionalValue / maxSafeLeverage;
+            const requiredExtraPadding = Math.max(0, requiredTotalMargin - MARGIN_USDT);
+
+            console.error(`\n   💡 SUGGESTION TO AVOID LIQUIDATION (Keep SAME position size):`);
+            console.error(`      Option A (Lower Lever): Decrease Leverage to ${maxSafeLeverage}x and set Base Margin to $${requiredTotalMargin.toFixed(2)} USDT.`);
+            console.error(`      -> Run: npm start ${SYMBOL} ${maxSafeLeverage} ${requiredTotalMargin.toFixed(2)}`);
+            if (requiredExtraPadding > 0) {
+                console.error(`      Option B (Add Padding): Keep Leverage at ${LEVERAGE}x and add $${requiredExtraPadding.toFixed(2)} USDT as Extra Safety Padding.`);
+                console.error(`      -> Run: npm start ${SYMBOL} ${LEVERAGE} ${MARGIN_USDT} ${requiredExtraPadding.toFixed(2)}`);
+            }
+        } else {
+            console.error(`\n   💡 SUGGESTION TO AVOID LIQUIDATION:`);
+            console.error(`      Even at 1x leverage, this grid range is too wide compared to the SL. Please narrow the grid percentage range.`);
+        }
+
+        console.error(`\n   Action: Decrease leverage, explicitly shorten the SL buffer, or compress the grid range.`);
+        process.exit(1);
+    }
+
 
     // 8. Pre-flight Margin Verification (Check OKX Minimum Investment)
     console.log(`\n⚙️ Validating Margin Requirements...`);
@@ -216,9 +269,15 @@ async function deployDualGrids() {
     console.log(`========================================`);
     console.log(` Pair:              ${SYMBOL} (Funding Rate: ${currentFundingRate.toFixed(5)}%)`);
     console.log(` Leverage:          ${LEVERAGE}x (Isolated)`);
-    console.log(` Margin per Bot:    $${MARGIN_USDT} USDT`);
-    console.log(` Min Required:      $${minMarginRequired.toFixed(2)} USDT`);
-    console.log(` Total Margin:      $${MARGIN_USDT * 2} USDT`);
+    console.log(` Base Margin/Bot:   $${MARGIN_USDT} USDT`);
+    if (EXTRA_MARGIN_USDT > 0) {
+        console.log(` Safety Padding/Bot:$${EXTRA_MARGIN_USDT} USDT`);
+        console.log(` Effective Lever:   ${effectiveLeverage.toFixed(2)}x`);
+    } else {
+        console.log(` Safety Padding:    None! (Hint: Append a 4th argument)`);
+    }
+    console.log(` Min Base Required: $${minMarginRequired.toFixed(2)} USDT`);
+    console.log(` Total Capital Use: $${TOTAL_WALLET_REQUIRED} USDT`);
     console.log(` Grids per Bot:     ${gridNum} (Geometric)`);
     console.log(` Step Profit:       ${(expectedProfitPerGrid * 100).toFixed(3)}%`);
     console.log(` Long Bot SL:       $${longSL.toFixed(tickDecimals)}`);
@@ -251,9 +310,28 @@ async function deployDualGrids() {
         const res = await okxRequest('POST', '/api/v5/tradingBot/grid/order-algo', payload);
 
         if (res.code === '0') {
+            const algoId = res.data[0].algoId;
             console.log(`\n✅ ${direction.toUpperCase()} Bot Created Successfully!`);
-            console.log(`   ID: ${res.data[0].algoId}`);
+            console.log(`   ID: ${algoId}`);
             console.log(`   TP: $${tp.toFixed(tickDecimals)} | SL: $${sl.toFixed(tickDecimals)}`);
+
+            if (EXTRA_MARGIN_USDT > 0) {
+                console.log(`   ⚙️ Injecting $${EXTRA_MARGIN_USDT} Extra Safety Padding into ${algoId}...`);
+                // Give OKX a brief moment to initialize the order state internally
+                await new Promise(resolve => setTimeout(resolve, 2000));
+
+                const marginAddRes = await okxRequest('POST', '/api/v5/tradingBot/grid/margin-balance', {
+                    algoId: algoId,
+                    type: 'add',
+                    amt: EXTRA_MARGIN_USDT.toString()
+                });
+
+                if (marginAddRes && marginAddRes.code === '0') {
+                    console.log(`   🛡️ Successfully locked in $${EXTRA_MARGIN_USDT} Extra Margin!`);
+                } else {
+                    console.error(`   ❌ Failed to immediately add extra margin. Please add manually via OKX App. Reason:`, marginAddRes?.msg || "Unknown");
+                }
+            }
         } else {
             console.error(`\n❌ Failed to create ${direction.toUpperCase()} Bot:`, res.msg);
             console.error(res.data);
