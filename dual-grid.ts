@@ -74,6 +74,20 @@ async function deployDualGrids() {
     console.log(`   -> Target Margin per Bot: $${MARGIN_USDT} USDT (${MARGIN_USDT * 2} USDT Total)`);
     console.log(`   -> Leverage: ${LEVERAGE}x`);
 
+    console.log(`\n⚙️ Ensuring Isolated Margin Mode for ${SYMBOL}...`);
+    const levRes = await okxRequest('POST', '/api/v5/account/set-leverage', {
+        instId: SYMBOL,
+        lever: LEVERAGE.toString(),
+        mgnMode: 'isolated'
+    });
+
+    // 51019 is OKX's 'leverage has not changed' error code which can be ignored safely
+    if (levRes.code !== '0' && levRes.code !== '51019') {
+        console.error(`\n❌ Failed to enforce Isolated Margin Mode / Leverage:`, levRes.msg);
+        process.exit(1);
+    }
+    console.log(`✅ Isolated Margin Confirmed.`);
+
     // 1. Check wallet balance
     const balRes = await okxRequest('GET', '/api/v5/account/balance');
     const usdtDetails = balRes.data[0].details.find((d: any) => d.ccy === 'USDT');
