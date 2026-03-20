@@ -47,6 +47,9 @@ const LEVERAGE = parseInt(args[1], 10);
 const MARGIN_USDT = parseFloat(args[2]);
 const EXTRA_MARGIN_USDT = args[3] ? parseFloat(args[3]) : 0;
 
+// Minimum Absolute Profit per Grid Order Close (USDT)
+const MIN_ABSOLUTE_PROFIT_USDT = 0.05;
+
 // ==========================================
 // 2. OKX API CORE FUNCTIONS
 // ==========================================
@@ -158,16 +161,21 @@ async function deployDualGrids() {
 
     // Geometric grid ratio: (maxPx / minPx) ^ (1 / gridNum)
     let expectedProfitPerGrid = Math.pow(maxPx / minPx, 1 / gridNum) - 1;
+    let netAbsoluteProfitPerGrid = (notionalValue / gridNum) * (expectedProfitPerGrid - FEE_THRESHOLD);
 
-    // Step down grid number until we find one that is safely above the fee threshold, down to 75.
-    while (gridNum > 75 && expectedProfitPerGrid <= FEE_THRESHOLD) {
+    // Step down grid number until we find one that is safely above the fee threshold AND meets absolute profit, down to minimum grids (2).
+    while (gridNum > 2 && (expectedProfitPerGrid <= FEE_THRESHOLD || netAbsoluteProfitPerGrid < MIN_ABSOLUTE_PROFIT_USDT)) {
         gridNum--;
         expectedProfitPerGrid = Math.pow(maxPx / minPx, 1 / gridNum) - 1;
+        netAbsoluteProfitPerGrid = (notionalValue / gridNum) * (expectedProfitPerGrid - FEE_THRESHOLD);
+        // console.log(`gridNum: ${gridNum} netAbsoluteProfitPerGrid: ${netAbsoluteProfitPerGrid}`)
     }
 
-    if (expectedProfitPerGrid <= 0.001) { // Hard fail if below 0.1%
-        console.error(`\n❌ Calculated Grid Profit (${(expectedProfitPerGrid * 100).toFixed(3)}%) is less than expected round-trip fees (~0.1%).`);
-        console.error(`   Decrease Max grids or widen percentage range. Aborting.`);
+    if (expectedProfitPerGrid <= FEE_THRESHOLD || netAbsoluteProfitPerGrid < MIN_ABSOLUTE_PROFIT_USDT) {
+        console.error(`\n❌ Calculated Grid Profit is too low!`);
+        console.error(`   Net Absolute Profit per grid: $${netAbsoluteProfitPerGrid.toFixed(3)} (Minimum required: $${MIN_ABSOLUTE_PROFIT_USDT})`);
+        console.error(`   Or Profit % (${(expectedProfitPerGrid * 100).toFixed(3)}%) is less than expected round-trip fees (~0.12%).`);
+        console.error(`   Decrease Max grids, widen percentage range, or increase base margin. Aborting.`);
         process.exit(1);
     }
 
@@ -175,6 +183,7 @@ async function deployDualGrids() {
     console.log(`   Contract Size: 1 contract = ${ctVal} ${SYMBOL.split('-')[0]}`);
     console.log(`   Automatically Selected Grids: ${gridNum}`);
     console.log(`   Expected Return per Grid Step: ${(expectedProfitPerGrid * 100).toFixed(3)}%`);
+    console.log(`   Net Absolute Profit per Grid: $${netAbsoluteProfitPerGrid.toFixed(3)} USDT`);
 
     // 7. Calculate TP and SL (20% buffer distance outside grid)
     const bufferDistance = gridRange * bufferDistanceToClose;
@@ -278,7 +287,10 @@ async function deployDualGrids() {
     console.log(` Min Base Required: $${minMarginRequired.toFixed(2)} USDT`);
     console.log(` Total Capital Use: $${TOTAL_WALLET_REQUIRED} USDT`);
     console.log(` Grids per Bot:     ${gridNum} (Geometric)`);
-    console.log(` Step Profit:       ${(expectedProfitPerGrid * 100).toFixed(3)}%`);
+    console.log(` Margin per Grid:   $${(MARGIN_USDT / gridNum).toFixed(3)} USDT`);
+    console.log(` Notional/Grid:     $${(notionalValue / gridNum).toFixed(3)}`);
+    console.log(` Step Profit %:     ${(expectedProfitPerGrid * 100).toFixed(3)}%`);
+    console.log(` Step Profit $:     $${netAbsoluteProfitPerGrid.toFixed(3)} USDT (Net)`);
     console.log(` Long Bot SL:       $${longSL.toFixed(tickDecimals)}`);
     console.log(` Short Bot SL:      $${shortSL.toFixed(tickDecimals)}`);
     console.log(`========================================`);
