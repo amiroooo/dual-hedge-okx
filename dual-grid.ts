@@ -26,8 +26,10 @@ const IS_SIMULATED = process.env.OKX_TEST === 'true';
 const API_KEY = IS_SIMULATED ? process.env.OKX_API_KEY_TEST as string : process.env.OKX_API_KEY_LIVE as string;
 const API_SECRET = IS_SIMULATED ? process.env.OKX_API_SECRET_TEST as string : process.env.OKX_API_SECRET_LIVE as string;
 const API_PASSPHRASE = process.env.OKX_API_PASSPHRASE as string;
-
+const bufferDistanceToClose = Number(process.env.OKX_BUFFER_DISTANCE_TO_CLOSE) || 0.02;
 const gridPercentRange = Number(process.env.OKX_GRID_PERCENTAGE_RANGE) || 0.10;
+const liqPercentageDistance = 0.1;
+
 
 const BASE_URL = 'https://www.okx.com';
 
@@ -44,9 +46,6 @@ const SYMBOL = args[0];
 const LEVERAGE = parseInt(args[1], 10);
 const MARGIN_USDT = parseFloat(args[2]);
 const EXTRA_MARGIN_USDT = args[3] ? parseFloat(args[3]) : 0;
-
-// Target Profit Config
-const TARGET_PROFIT_USDT = 0.15;
 
 // ==========================================
 // 2. OKX API CORE FUNCTIONS
@@ -178,7 +177,7 @@ async function deployDualGrids() {
     console.log(`   Expected Return per Grid Step: ${(expectedProfitPerGrid * 100).toFixed(3)}%`);
 
     // 7. Calculate TP and SL (20% buffer distance outside grid)
-    const bufferDistance = gridRange * 0.2;
+    const bufferDistance = gridRange * bufferDistanceToClose;
     const longSL = minPx - bufferDistance;
     const longTP = maxPx + bufferDistance;
     const shortSL = maxPx + bufferDistance;
@@ -198,8 +197,8 @@ async function deployDualGrids() {
     // Ensure the liquidation price is at least 20% FURTHER away than the SL.
     // For a Long: Liquidation MUST be < SL * 0.80
     // For a Short: Liquidation MUST be > SL * 1.20
-    const reqLiqLong = longSL * 0.90;
-    const reqLiqShort = shortSL * 1.10;
+    const reqLiqLong = longSL * (1 - liqPercentageDistance);
+    const reqLiqShort = shortSL * (1 + liqPercentageDistance);
 
     if (estLiqLong > reqLiqLong || estLiqShort < reqLiqShort) {
         console.error(`\n❌ HIGH LIQUIDATION RISK DETECTED:`);
@@ -304,7 +303,8 @@ async function deployDualGrids() {
             lever: LEVERAGE.toString(),
             sz: MARGIN_USDT.toString(),
             slTriggerPx: sl.toFixed(tickDecimals),
-            tpTriggerPx: tp.toFixed(tickDecimals)
+            tpTriggerPx: tp.toFixed(tickDecimals),
+            tdMode: 'isolated',
         };
 
         const res = await okxRequest('POST', '/api/v5/tradingBot/grid/order-algo', payload);
