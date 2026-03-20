@@ -25,10 +25,12 @@ OKX native geometric grids are created using `runType: '2'`.
   - It enforces a **20% safety buffer**: The estimated liquidation price must be at least 20% further away than the manual Stop Loss.
   - **Post-Creation Injection**: After `order-algo` (bot creation), the script waits 2 seconds and calls `POST /api/v5/tradingBot/grid/margin-balance` with `type: 'add'` to inject the padding.
 
-### 3. OKX API Payload Nuances
-- **Creation (`order-algo`)**: Expects a single **Object**.
-- **Stoppage (`stop-order-algo`)**: Expects an **Array of Objects** `[{...}]`. Failing to wrap this in an array results in a `50000: Body cannot be empty` error.
-- **PnL Monitoring**: Active grid bots use a field named `totalPnl` for the combined realized + unrealized profit. The standard `pnl` field often returns `0` until the bot is stopped.
+### 4. Margin Partitioning (Actual vs. Reserved)
+When an LLM works on the margin logic, it must understand OKX's internal split:
+- **Actual Margin**: The portion of `sz` used for placing grid orders.
+- **Reserved Margin**: The portion of `sz` held by OKX as a safety buffer within the bot.
+- **Manual Padding**: The `EXTRA_MARGIN_USDT` added via `margin-balance/add`. This is 100% "Reserved" (safety only).
+**Constraint**: Users cannot manually define the internal split of `sz`. They can only control the total `sz` and the additional `Manual Padding`.
 
 ---
 

@@ -39,7 +39,7 @@ async function sleep(ms: number) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function scanPairs() {
+export async function scanPairs() {
     console.log(`\n🔍 Scanning OKX SWAP Markets for Optimal Grid Bot Pairs...`);
     console.log(`   Criteria: High Volatility, Low 7d Range (<25%), Top Volume`);
 
@@ -47,7 +47,7 @@ async function scanPairs() {
     const res = await okxRequest('GET', '/api/v5/market/tickers?instType=SWAP');
     if (!res || res.code !== '0') {
         console.error('❌ Failed to fetch tickers.');
-        return;
+        return [];
     }
 
     // Filter by USDT pairs and Volume (e.g., > $50M)
@@ -95,9 +95,14 @@ async function scanPairs() {
             }
 
             const rangePct = (maxPrice - minPrice) / minPrice;
-            const displacement = Math.abs(parseFloat(candles[0][4]) - parseFloat(candles[candles.length - 1][4]));
-            const chopScore = totalPath / (maxPrice - minPrice || 1);
             const fundingRate = parseFloat(fundingRes.data[0].fundingRate);
+            const chopScore = totalPath / (maxPrice - minPrice || 1);
+
+            // Suggested Slippage based on Volume
+            let suggestedSlippage = 0.01; // Default 1%
+            if (pair.volCcy24h > 500000000) suggestedSlippage = 0.001; // 0.1%
+            else if (pair.volCcy24h > 100000000) suggestedSlippage = 0.002; // 0.2%
+            else if (pair.volCcy24h > 50000000) suggestedSlippage = 0.005; // 0.5%
 
             // Only consider pairs that stayed roughly within a reasonable range (e.g., < 25% total 7d swing)
             if (rangePct < 0.25) {
@@ -107,7 +112,8 @@ async function scanPairs() {
                     'Chop Score': chopScore.toFixed(2),
                     'Funding': `${(fundingRate * 100).toFixed(4)}%`,
                     vol: pair.volCcy24h,
-                    score: chopScore
+                    score: parseFloat(chopScore.toFixed(2)),
+                    suggestedSlippage: suggestedSlippage
                 });
                 process.stdout.write(`✅ Done\n`);
             } else {
@@ -134,11 +140,21 @@ async function scanPairs() {
         Symbol: r.Symbol,
         'Range (7d)': r['Range (7d)'],
         'Chop Score': r['Chop Score'],
-        'Funding Rate': r['Funding']
+        'Funding Rate': r['Funding'],
+        'Sug. Slippage': `${(r.suggestedSlippage * 100).toFixed(1)}% (${r.suggestedSlippage})`
     })));
 
     console.log(`\n💡 How to use: Pick a pair with high Chop Score and low/positive Funding.`);
-    console.log(`   Example: npx ts-node dual-grid.ts ${top10[0]?.Symbol || 'BTC-USDT-SWAP'} 10 200`);
+    console.log(`   Slippage Info: Higher volume = lower slippage. Use 'Sug. Slippage' in dual-grid.ts.`);
+    
+    return top10;
 }
 
-scanPairs();
+import { fileURLToPath } from 'url';
+import { resolve } from 'path';
+
+// Run if script executed directly
+const isMain = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
+if (isMain) {
+    scanPairs();
+}

@@ -1,41 +1,27 @@
-# Skill: Dual-Hedged Futures Grid (OpenClaw 2026)
+# Skill: OKX Dual-Hedged Futures Grid (Geometric)
 
 ## Overview
-A delta-neutral volatility capture strategy that deploys two simultaneous Futures Grid Algos (LONG and SHORT) on the same Binance pair. It utilizes a 'Kill Switch' mechanism to ensure atomic closure of positions if market conditions breach the defined safety range.
+A volatility-capture toolkit that deploys dual-hedged geometric grid bots on OKX perpetual swaps. Focuses on high-chop, low-drift pairs to ensure range preservation and consistent profit compounding.
 
-## Architecture
-- **Framework:** OpenClaw (2026)
-- **Language:** TypeScript
-- **Exchange:** Binance Futures (Testnet Supported)
-- **Communication:** 
-  - `/market`: WebSocket stream for Mark Price monitoring.
-  - `/private`: WebSocket stream for Strategy State/Updates.
-  - `REST`: Order execution (Place/Cancel/Close).
+## Components
+1. **Find Optimal Pairs**: Analysis script to identify high-volatility pairs that fit a ±10% range.
+   - Run: `/scan-pairs`
+2. **Deploy Dual Grids**: Automated geometric bot deployment with Liquidation-vs-SL safety checks.
+   - Run: `/deploy-dual-grid <PAIR> <LEVERAGE> <MARGIN> [PADDING]`
+3. **Portfolio Manager**: Real-time tracking and a one-click kill-switch for all positions.
+   - Run: `/manage-bots`
 
-## Parameters
-| Parameter | Type | Description |
-| :--- | :--- | :--- |
-| `symbol` | string | Trading pair (e.g., "BTCUSDT") |
-| `marginPerBot` | number | USDT margin allocated to EACH side (Long & Short) |
-| `leverage` | number | Futures leverage (e.g., 5, 10, 20) |
-| `deltaPercent` | number | Range deviation from current price (e.g., 0.05 for 5%) |
-| `gridLevels` | number | Number of orders per side (Default: 10) |
+## Core Metrics
+- **Chop Score**: Ratio of cumulative movement over absolute range. (High Score = Better for Grids).
+- **Effective Leverage**: Calculated by factoring in manual "Extra Padding" for accurate liquidation prediction.
+- **Geometric Grid num**: Automatically optimized to meet a minimum profit-per-step threshold.
 
-## Safety Logic (Atomic Close)
-The system maintains a **Kill Switch** state.
-1. **Monitor:** Continuously listens to Mark Price via `/market` WS.
-2. **Trigger:** 
-   - If Mark Price exits the calculated `[LowerBound, UpperBound]`.
-   - OR if `/private` WS emits a `STRATEGY_UPDATE` indicating one bot has stopped/failed.
-3. **Action:** 
-   - Immediately cancels all open orders on both Long and Short grids.
-   - Market closes all open positions on both sides.
-   - Emits `SKILL_TERMINATED` event.
-
-## Risks
-- **Liquidation Risk:** High leverage with grid strategies can lead to liquidation if price trends strongly in one direction before the Kill Switch triggers.
-- **Slippage:** Atomic close uses Market Orders; significant slippage may occur during high volatility.
-- **Funding Fees:** Holding simultaneous Long/Short positions incurs funding fees on both sides (netting depends on rate).
+## Configuration
+Requires `.env` with:
+- `OKX_API_KEY_LIVE` / `OKX_API_SECRET_LIVE`
+- `OKX_API_KEY_TEST` / `OKX_API_SECRET_TEST`
+- `OKX_API_PASSPHRASE`
+- `OKX_TEST=true` (Toggle for Demo vs Live)
 
 ## Version
-1.0.0 (OpenClaw 2026 Compatible)
+2.0.0 (Supports Geometric Grids & Safety Padding)
