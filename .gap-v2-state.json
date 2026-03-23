@@ -1,0 +1,15 @@
+{
+  "CFX-USDT-SWAP": {
+    "trades": [
+      {
+        "side": "short",
+        "entryPx": 0.06009,
+        "sz": 166
+      }
+    ],
+    "ctVal": 10,
+    "D_price": 0.006024096385542169,
+    "targetPx": 0.05406590361445783,
+    "reversePx": 0.06611409638554216
+  }
+}
