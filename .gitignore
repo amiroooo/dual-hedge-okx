@@ -1,3 +1,5 @@
 .env
 node_modules/*
 *.log
+zr-hedged-performance.json
+.zr-hedged-state.json
