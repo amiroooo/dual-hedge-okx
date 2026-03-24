@@ -29,6 +29,8 @@ const SLIPPAGE_PCT = 0.0002; // 0.02% slippage buffer
 const BASE_URL = 'https://www.okx.com';
 const STATE_FILE = '.zr-hedged-state.json';
 const PERF_LOG = 'zr-hedged-performance.json';
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
 // ==========================================
 // 2. STATE MANAGEMENT
@@ -93,6 +95,33 @@ function logEvent(event: any) {
     }
     history.push(entry);
     fs.writeFileSync(PERF_LOG, JSON.stringify(history, null, 2));
+
+    // Telegram Notification
+    if (TELEGRAM_TOKEN && TELEGRAM_CHAT_ID) {
+        let msg = `🔔 *[ZR-Hedged]*\n`;
+        msg += `💎 *Symbol*: ${event.sym}\n`;
+        msg += `🎬 *Action*: ${event.action.toUpperCase()}\n`;
+        if (event.details) {
+            for (const [k, v] of Object.entries(event.details)) {
+                msg += `🔹 *${k}*: ${typeof v === 'number' ? v.toFixed(6) : v}\n`;
+            }
+        }
+        msg += `⏰ *Time*: ${new Date().toLocaleTimeString()}`;
+        sendTelegramMessage(msg);
+    }
+}
+
+async function sendTelegramMessage(text: string) {
+    if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) return;
+    try {
+        await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
+            chat_id: TELEGRAM_CHAT_ID,
+            text,
+            parse_mode: 'Markdown'
+        });
+    } catch (e: any) {
+        terror(`❌ Telegram Failed: ${e.response?.data?.description || e.message}`);
+    }
 }
 
 // ==========================================
