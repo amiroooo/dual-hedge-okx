@@ -104,15 +104,17 @@ function logEvent(event: any) {
 
     // Telegram Notification
     if (TELEGRAM_TOKEN && TELEGRAM_CHAT_ID) {
-        let msg = `🔔 *[ZR-Hedged]*\n`;
-        msg += `💎 *Symbol*: ${event.sym}\n`;
-        msg += `🎬 *Action*: ${event.action.toUpperCase()}\n`;
+        let msg = `<b>[ZR-Hedged]</b>\n`;
+        msg += `💎 <b>Symbol</b>: ${event.sym}\n`;
+        msg += `🎬 <b>Action</b>: ${event.action.toUpperCase()}\n`;
         if (event.details) {
             for (const [k, v] of Object.entries(event.details)) {
-                msg += `🔹 *${k}*: ${typeof v === 'number' ? v.toFixed(6) : v}\n`;
+                let val = v;
+                if (typeof v === 'number') val = v.toFixed(6);
+                msg += `🔹 <b>${k}</b>: ${val}\n`;
             }
         }
-        msg += `⏰ *Time*: ${new Date().toLocaleTimeString()}`;
+        msg += `⏰ <b>Time</b>: ${new Date().toLocaleTimeString()}`;
         sendTelegramMessage(msg);
     }
 }
@@ -127,7 +129,7 @@ async function sendTelegramMessage(text: string) {
         await axios.post(`https://api.telegram.org/${apiPath}/sendMessage`, {
             chat_id: TELEGRAM_CHAT_ID.trim(),
             text,
-            parse_mode: 'Markdown'
+            parse_mode: 'HTML'
         });
     } catch (e: any) {
         if (e.response?.status === 404) {
@@ -419,12 +421,14 @@ async function checkAlgoStatus(instId: string, algoId: string): Promise<string |
     return null;
 }
 
-async function verifyBundleConsistency(sym: string, state: ZRState): Promise<{ consistent: boolean, liveUpl: number }> {
+async function verifyBundleConsistencyExtended(sym: string, state: ZRState): Promise<{ consistent: boolean, liveUpl: number, liveLong: number, liveShort: number }> {
     // Grace period check: Skip consistency if we just reversed recently (allow 30s for OKX to sync)
     if (state.lastRevTime && (Date.now() - state.lastRevTime < 30000)) {
         // Return dummy consistent but try to get current UPL from cache for monitor loop
         const upl = positionCache[sym] ? (positionCache[sym].long.upl + positionCache[sym].short.upl) : 0;
-        return { consistent: true, liveUpl: upl };
+        const l = positionCache[sym]?.long.sz || 0;
+        const s = positionCache[sym]?.short.sz || 0;
+        return { consistent: true, liveUpl: upl, liveLong: l, liveShort: s };
     }
 
     let liveLong = 0;
@@ -437,7 +441,7 @@ async function verifyBundleConsistency(sym: string, state: ZRState): Promise<{ c
         liveUpl = positionCache[sym].long.upl + positionCache[sym].short.upl;
     } else {
         const res = await okxRequest('GET', `/api/v5/account/positions?instId=${sym}`);
-        if (!res || res.code !== '0') return { consistent: true, liveUpl: 0 };
+        if (!res || res.code !== '0') return { consistent: true, liveUpl: 0, liveLong: 0, liveShort: 0 };
         for (const pos of res.data) {
             if (pos.mgnMode !== 'isolated') continue;
             const sideUpl = parseFloat(pos.upl || '0');
@@ -455,19 +459,9 @@ async function verifyBundleConsistency(sym: string, state: ZRState): Promise<{ c
     }
 
     if (liveLong !== expectedLong || liveShort !== expectedShort) {
-        // SELF-HEALING: If the mismatch matches our planned NEXT leg size, we autocorrect!
-        // This handles the case where exchange position syncs faster than the Algo Order status check.
-        const lastLeg = state.legs[state.legs.length - 1];
-        const nextSide = lastLeg.side === 'long' ? 'short' : 'long';
-        
-        // We know what the 'next' sz should be (we calculate it in reversal block but it's not saved yet)
-        // For simplicity, if we see exactly one side increasing while the other is stable, 
-        // and we were expecting a reversal, we'll mark as 'reversal_pending' instead of mismatch.
-        
-        tlog(`⚠️ [${sym}] Consistency Mismatch! OKX: L:${liveLong} S:${liveShort} | JSON: L:${expectedLong} S:${expectedShort}`);
-        return { consistent: false, liveUpl };
+        return { consistent: false, liveUpl, liveLong, liveShort };
     }
-    return { consistent: true, liveUpl };
+    return { consistent: true, liveUpl, liveLong, liveShort };
 }
 
 // ==========================================
@@ -581,35 +575,30 @@ async function processSymbolHedged(sym: string) {
             logEvent({ sym, action: 'start', details: { side, entryPx: P, sz: sz1, tpPx, slPx, revAlgoId } });
         }
     } else {
-        // 1. REVERSAL TRIGGER MONITOR (Check logic first so state is updated before consistency)
-        const revStatus = await checkAlgoStatus(sym, state.revAlgoId);
-        const lastLeg = state.legs[state.legs.length - 1];
-        const isLong = lastLeg.side === 'long';
+        // 1. FETCH LIVE STATE FIRST
+        const { consistent, liveUpl, liveLong, liveShort } = await verifyBundleConsistencyExtended(sym, state);
         
-        let shouldProcessReversal = false;
-        if (revStatus === 'effective') {
-            shouldProcessReversal = true;
-        } else if (revStatus === null && state.revAlgoId === 'manual') {
-            if ((isLong && P <= state.currentReversePx) || (!isLong && P >= state.currentReversePx)) {
-                shouldProcessReversal = true;
-            }
+        // 2. SELF-HEALING REVERSAL CHECK
+        const lastLeg = state.legs[state.legs.length - 1];
+        const currentSide = lastLeg.side;
+        const nextSide = currentSide === 'long' ? 'short' : 'long';
+
+        // Check if next leg is already visible on exchange
+        let externalReversalDetected = false;
+        if (nextSide === 'long' && liveLong > (state.legs.filter(l => l.side === 'long').reduce((acc, l) => acc + l.sz, 0))) {
+            externalReversalDetected = true;
+        } else if (nextSide === 'short' && liveShort > (state.legs.filter(l => l.side === 'short').reduce((acc, l) => acc + l.sz, 0))) {
+            externalReversalDetected = true;
         }
 
-        if (shouldProcessReversal) {
-            if (state.legs.length >= MAX_REVERSALS) {
-                tlog(`\n💀 [${sym}] Max Reversals Hit. Closing at loss.`);
-                await closeAllPositions(sym);
-                delete activeState.symbols[sym];
-                saveState();
-                return;
-            }
-
-            tlog(`\n🔄 [${sym}] REVERSAL DETECTED! (Status: ${revStatus || 'polling'})...`);
-            const newSide = isLong ? 'short' : 'long';
-            const tickDecimals = state.tickDecimals;
+        const revStatus = await checkAlgoStatus(sym, state.revAlgoId);
+        if (revStatus === 'effective' || externalReversalDetected) {
+            tlog(`\n🔄 [${sym}] REVERSAL DETECTED! (Status: ${revStatus || 'external/positions'})...`);
             
-            const newTargetPx = Number((newSide === 'short' ? state.P_down_line - state.D_tp_price : state.P_up_line + state.D_tp_price).toFixed(tickDecimals));
-            const newReversePx = Number((newSide === 'short' ? state.P_up_line : state.P_down_line).toFixed(tickDecimals));
+            // Calculate new leg info (using same math as placement)
+            const tickDecimals = state.tickDecimals;
+            const newTargetPx = Number((nextSide === 'short' ? state.P_down_line - state.D_tp_price : state.P_up_line + state.D_tp_price).toFixed(tickDecimals));
+            const newReversePx = Number((nextSide === 'short' ? state.P_up_line : state.P_down_line).toFixed(tickDecimals));
 
             let currentPnlAtNewTarget = 0;
             for (const leg of state.legs) {
@@ -620,25 +609,15 @@ async function processSymbolHedged(sym: string) {
             const estFeesPrev = (totalSzCurrently * state.ctVal * state.currentReversePx * FEE_PCT) * 2;
             const targetUSDT = state.E_profit + CLOSE_USDT_PROFIT + estFeesPrev;
             const netNeeded = targetUSDT - currentPnlAtNewTarget;
-            
             const effectiveDist = (Math.abs(newTargetPx - state.currentReversePx) * (1 - SLIPPAGE_PCT)) * state.ctVal;
             const feeCostPerContract = (state.currentReversePx * FEE_PCT) * 2 * state.ctVal;
-            const den = effectiveDist - feeCostPerContract;
-            const sz = Math.ceil((netNeeded / den) * MATH_BUFFER);
+            const sz = Math.ceil((netNeeded / (effectiveDist - feeCostPerContract)) * MATH_BUFFER);
 
-            // AUTO-RECOVERY CHECK: If the position already exists on OKX, we just use it!
-            const livePos = positionCache[sym];
-            if (livePos && ((newSide === 'long' && livePos.long.sz >= sz) || (newSide === 'short' && livePos.short.sz >= sz))) {
-                tlog(`🚀 [${sym}] Reversal already detected on exchange (Size: ${newSide === 'long' ? livePos.long.sz : livePos.short.sz}). Skipping order, updating state.`);
-                shouldProcessReversal = true;
-            }
-
-            tlog(`🧪 [${sym}] Reversal Math (Leg ${state.legs.length + 1}): Target:$${targetUSDT.toFixed(2)}, Current:$${currentPnlAtNewTarget.toFixed(2)}, Needed:$${netNeeded.toFixed(2)}, Sz:${sz}`);
-
-            state.legs.push({ side: newSide, entryPx: state.currentReversePx, sz });
+            // Update state with the new leg
+            state.legs.push({ side: nextSide, entryPx: state.currentReversePx, sz });
             
-            const nextSide = newSide === 'long' ? 'short' : 'long';
-            const nextTargetPx = nextSide === 'short' ? state.P_down_line - state.D_tp_price : state.P_up_line + state.D_tp_price;
+            const nextSideReversed = nextSide === 'long' ? 'short' : 'long';
+            const nextTargetPx = nextSideReversed === 'short' ? state.P_down_line - state.D_tp_price : state.P_up_line + state.D_tp_price;
             const pnlAtNextTarget = state.legs.reduce((acc, l) => {
                 const diff = l.side === 'long' ? (nextTargetPx - l.entryPx) : (l.entryPx - nextTargetPx);
                 return acc + (diff * l.sz * state.ctVal);
@@ -647,30 +626,28 @@ async function processSymbolHedged(sym: string) {
             const totalSzSoFar = state.legs.reduce((acc, l) => acc + l.sz, 0);
             const estimatedFeesTotal = (totalSzSoFar * state.ctVal * state.currentReversePx * FEE_PCT) * 2;
             const neededNext = (state.E_profit + CLOSE_USDT_PROFIT + estimatedFeesTotal) - pnlAtNextTarget;
-            
             const effectiveDistNext = (Math.abs(nextTargetPx - newReversePx) * (1 - SLIPPAGE_PCT)) * state.ctVal;
             const feeCostPerContractNext = (newReversePx * FEE_PCT) * 2 * state.ctVal;
-            const szNext = Math.ceil(neededNext / (effectiveDistNext - feeCostPerContractNext));
+            const szNext = Math.ceil((neededNext / (effectiveDistNext - feeCostPerContractNext)) * MATH_BUFFER);
 
-            const nextAlgoId = await placeTriggerOrder(sym, nextSide === 'long' ? 'buy' : 'sell', nextSide, newReversePx, szNext);
+            const nextAlgoId = await placeTriggerOrder(sym, nextSideReversed === 'long' ? 'buy' : 'sell', nextSideReversed, newReversePx, szNext);
 
             state.targetPx = newTargetPx;
             state.currentReversePx = newReversePx;
             state.revAlgoId = nextAlgoId || 'manual';
             state.lastRevTime = Date.now();
             saveState();
-            logEvent({ sym, action: 'reversal', details: { side: newSide, entryPx: state.currentReversePx, sz, count: state.legs.length, nextAlgoId } });
+            logEvent({ sym, action: 'reversal', details: { side: nextSide, sz, count: state.legs.length, nextAlgoId } });
+            return;
         }
 
-        // 2. CONSISTENCY CHECK (3 Strikes)
-        const { consistent, liveUpl } = await verifyBundleConsistency(sym, state);
+        // 3. CONSISTENCY CHECK (If no reversal detected but sizes mismatch)
         if (!consistent) {
-            // Check if positions were intentionally closed by the exchange (TP/SL)
             const livePositions = await okxRequest('GET', `/api/v5/account/positions?instId=${sym}`);
             const totalContracts = livePositions.data?.reduce((acc: number, p: any) => acc + Math.abs(parseInt(p.pos)), 0) || 0;
 
             if (totalContracts === 0) {
-                tlog(`🏁 [${sym}] No positions on exchange. Cycle finished externally. Cleaning state.`);
+                tlog(`🏁 [${sym}] No positions on exchange. Cycle finished externally.`);
                 await cancelAlgoOrder(sym, state.revAlgoId);
                 delete activeState.symbols[sym];
                 delete activeState.mismatches[sym];
@@ -682,28 +659,28 @@ async function processSymbolHedged(sym: string) {
             const count = (activeState.mismatches[sym] || 0) + 1;
             activeState.mismatches[sym] = count;
             if (count < 12) {
-                tlog(`⚠️ [${sym}] Consistency mismatch detected (${count}/12). Retrying in next loop...`);
+                tlog(`⚠️ [${sym}] Consistency Mismatch! OKX:L:${liveLong} S:${liveShort} | JSON:L:${(state.legs.filter(l=>l.side==='long').reduce((a,l)=>a+l.sz,0))} S:${(state.legs.filter(l=>l.side==='short').reduce((a,l)=>a+l.sz,0))} (${count}/12)`);
                 return;
             } else {
-                tlog(`❌ [${sym}] Local state out of sync for 12 consecutive loops. FORCING CLOSE ALL.`);
+                tlog(`❌ [${sym}] Out of sync. FORCING CLOSE ALL.`);
                 await cancelAllAlgoOrders(sym);
                 await closeAllPositions(sym);
                 delete activeState.symbols[sym];
                 delete activeState.mismatches[sym];
                 saveState();
-                logEvent({ sym, action: 'exit_mismatch', details: { msg: 'Forced close due to sync fail' } });
+                logEvent({ sym, action: 'exit_mismatch', details: { msg: 'Forced close' } });
                 return;
             }
         }
         if (activeState.mismatches[sym]) delete activeState.mismatches[sym];
 
-        // 3. MONITOR BUNDLE PNL
+        // 4. MONITOR PROFIT
         const totalSz = state.legs.reduce((acc, l) => acc + l.sz, 0);
         const feesPaidEst = (totalSz * state.ctVal * P * FEE_PCT) * 2;
         const bundlePnlNet = liveUpl - feesPaidEst;
 
         if (bundlePnlNet >= state.E_profit + CLOSE_USDT_PROFIT) {
-            tlog(`\n🎉 [${sym}] Bundle Profit Hit (Net): +$${bundlePnlNet.toFixed(2)} USDT (UPL: ${liveUpl.toFixed(2)}, Fees: -${feesPaidEst.toFixed(2)}). Closing all legs.`);
+            tlog(`\n🎉 [${sym}] Profit Net: +$${bundlePnlNet.toFixed(2)} USDT. Closing.`);
             await cancelAlgoOrder(sym, state.revAlgoId);
             await closeAllPositions(sym);
             delete activeState.symbols[sym];
