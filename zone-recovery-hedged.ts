@@ -2,6 +2,7 @@ import axios from 'axios';
 import * as crypto from 'crypto';
 import * as dotenv from 'dotenv';
 import * as fs from 'fs';
+import WebSocket from 'ws';
 
 dotenv.config();
 
@@ -22,9 +23,10 @@ const TP_PCT = Number(process.env.ZR_TP_PCT) || 0.01;
 const ZONE_PCT = Number(process.env.ZR_ZONE_PCT) || 0.01;
 const MAX_REVERSALS = Number(process.env.ZR_MAX_REVERSALS) || 5;
 const POLL_INTERVAL_MS = Number(process.env.ZR_POLL_INTERVAL_MS) || 5000;
-const CLOSE_USDT_PROFIT = 0.5; // Small threshold to cover fees and profit
-const FEE_PCT = 0.0005; // 0.05% estimated taker fee
-const SLIPPAGE_PCT = 0.0002; // 0.02% slippage buffer
+const CLOSE_USDT_PROFIT = Number(process.env.ZR_CLOSE_USDT_PROFIT) || 1.0; 
+const FEE_PCT = 0.0008; // 0.08% estimated taker fee (Very Conservative)
+const SLIPPAGE_PCT = 0.0010; // 0.10% slippage buffer (Aggressive)
+const MATH_BUFFER = Number(process.env.ZR_MATH_BUFFER) || 1.1; // 10% extra size for safety
 
 const BASE_URL = 'https://www.okx.com';
 const STATE_FILE = '.zr-hedged-state.json';
@@ -62,6 +64,7 @@ interface ManagerState {
 }
 
 let activeState: ManagerState = { symbols: {}, mismatches: {} };
+const priceCache: Record<string, number> = {};
 
 function round(val: number, decimals: number): number {
     return Number(val.toFixed(decimals));
@@ -158,17 +161,55 @@ async function okxRequest(method: string, endpoint: string, bodyObj: any = null)
 }
 
 async function getTickerPrice(instId: string): Promise<number> {
+    // 1. Check WebSocket Cache first
+    if (priceCache[instId]) return priceCache[instId];
+
+    // 2. Fallback to REST if cache is empty
     for (let i = 0; i < 3; i++) {
         const res = await okxRequest('GET', `/api/v5/market/ticker?instId=${instId}`);
         if (res && res.code === '0' && res.data?.length > 0) {
-            return parseFloat(res.data[0].last);
-        }
-        if (res && res.msg) {
-            terror(`⚠️ [${instId}] Ticker Attempt ${i+1} failed: ${res.msg} (Code: ${res.code})`);
+            const last = parseFloat(res.data[0].last);
+            priceCache[instId] = last; // Backfill cache
+            return last;
         }
         await new Promise(r => setTimeout(r, 1000));
     }
     return 0;
+}
+
+function initWebsocket(symbols: string[]) {
+    const wsUrl = IS_SIMULATED ? 'wss://wspap.okx.com:8443/ws/v5/public' : 'wss://ws.okx.com:8443/ws/v5/public';
+    tlog(`🔌 Initializing WebSocket (${IS_SIMULATED ? 'Demo' : 'Live'})...`);
+
+    const ws = new WebSocket(wsUrl);
+
+    ws.on('open', () => {
+        tlog('✅ WebSocket Connected.');
+        const args = symbols.map(s => ({ channel: 'tickers', instId: s }));
+        ws.send(JSON.stringify({ op: 'subscribe', args }));
+    });
+
+    ws.on('message', (data) => {
+        try {
+            const json = JSON.parse(data.toString());
+            if (json.arg?.channel === 'tickers' && json.data?.[0]?.last) {
+                const instId = json.arg.instId;
+                const last = parseFloat(json.data[0].last);
+                priceCache[instId] = last;
+            }
+        } catch (e) {}
+    });
+
+    ws.on('error', (err) => terror('❌ WebSocket Error:', err.message));
+    ws.on('close', () => {
+        tlog('⚠️ WebSocket Closed. Reconnecting in 5s...');
+        setTimeout(() => initWebsocket(symbols), 5000);
+    });
+
+    // Keepalive
+    setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) ws.send('ping');
+    }, 20000);
 }
 
 async function setAccountMode() {
@@ -375,6 +416,9 @@ async function runHedgedManager() {
 
     await setAccountMode();
     loadState();
+    
+    // START REAL-TIME PRICE FEED
+    initWebsocket(SYMBOLS);
 
     tlog("⚙️ Syncing leverage and cleaning orders for all symbols...");
     for (const sym of SYMBOLS) {
@@ -383,10 +427,11 @@ async function runHedgedManager() {
     }
 
     while (true) {
-        for (const sym of SYMBOLS) {
+        // Parallel processing of symbols for better reactivity
+        await Promise.all(SYMBOLS.map(async (sym) => {
             try { await processSymbolHedged(sym); }
             catch (e) { terror(`Error on ${sym}:`, e); }
-        }
+        }));
         await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
     }
 }
@@ -440,11 +485,18 @@ async function processSymbolHedged(sym: string) {
             const newTargetPx = nextSide === 'short' ? P - D_zone_price - D_tp_price : P + D_zone_price + D_tp_price;
             const currentPnlAtNewTarget = (side === 'long' ? (newTargetPx - P) : (P - newTargetPx)) * sz1 * ctVal;
             
-            // Add Fee Buffer: Estimated cost to open this leg and close the entire bundle eventually
-            const estimatedFees = (sz1 * ctVal * P * FEE_PCT) * 2; // Open + Close of this leg
-            const neededFromNewLeg = (D_tp_price * sz1 * ctVal + CLOSE_USDT_PROFIT + estimatedFees) - currentPnlAtNewTarget;
-            const distance = Math.abs(newTargetPx - reversePx) * (1 - SLIPPAGE_PCT); // Assume slightly less distance due to slippage
-            const sz2 = Math.ceil(neededFromNewLeg / (distance * ctVal));
+            // Step-by-step math for Leg 2
+            const prevLegsFees = (sz1 * ctVal * P * FEE_PCT) * 2;
+            const targetUSDT = (D_tp_price * sz1 * ctVal) + CLOSE_USDT_PROFIT + prevLegsFees;
+            const netNeeded = targetUSDT - currentPnlAtNewTarget;
+            
+            const effectiveDist = (Math.abs(newTargetPx - reversePx) * (1 - SLIPPAGE_PCT)) * ctVal;
+            const feeCostPerContract = (reversePx * FEE_PCT) * 2 * ctVal;
+            const den = effectiveDist - feeCostPerContract;
+            
+            const sz2 = Math.ceil((netNeeded / den) * MATH_BUFFER);
+
+            tlog(`🧪 [${sym}] Leg 2 Math: Target:$${targetUSDT.toFixed(2)}, Current:$${currentPnlAtNewTarget.toFixed(2)}, Needed:$${netNeeded.toFixed(2)}, Sz:${sz2}`);
 
             const revAlgoId = await placeTriggerOrder(sym, nextSide === 'long' ? 'buy' : 'sell', nextSide, reversePx, sz2);
 
@@ -497,10 +549,16 @@ async function processSymbolHedged(sym: string) {
                 else currentPnlAtNewTarget += (leg.entryPx - newTargetPx) * leg.sz * state.ctVal;
             }
             const totalSzCurrently = state.legs.reduce((acc, l) => acc + l.sz, 0);
-            const estFeesCumulative = (totalSzCurrently * state.ctVal * state.currentReversePx * FEE_PCT) * 2;
-            const neededFromNewLeg = (state.E_profit + CLOSE_USDT_PROFIT + estFeesCumulative) - currentPnlAtNewTarget;
-            const distance = Math.abs(newTargetPx - state.currentReversePx) * (1 - SLIPPAGE_PCT);
-            const sz = Math.ceil(neededFromNewLeg / (distance * state.ctVal));
+            const estFeesPrev = (totalSzCurrently * state.ctVal * state.currentReversePx * FEE_PCT) * 2;
+            const targetUSDT = state.E_profit + CLOSE_USDT_PROFIT + estFeesPrev;
+            const netNeeded = targetUSDT - currentPnlAtNewTarget;
+            
+            const effectiveDist = (Math.abs(newTargetPx - state.currentReversePx) * (1 - SLIPPAGE_PCT)) * state.ctVal;
+            const feeCostPerContract = (state.currentReversePx * FEE_PCT) * 2 * state.ctVal;
+            const den = effectiveDist - feeCostPerContract;
+            const sz = Math.ceil((netNeeded / den) * MATH_BUFFER);
+
+            tlog(`🧪 [${sym}] Reversal Math (Leg ${state.legs.length + 1}): Target:$${targetUSDT.toFixed(2)}, Current:$${currentPnlAtNewTarget.toFixed(2)}, Needed:$${netNeeded.toFixed(2)}, Sz:${sz}`);
 
             state.legs.push({ side: newSide, entryPx: state.currentReversePx, sz });
             
@@ -514,8 +572,10 @@ async function processSymbolHedged(sym: string) {
             const totalSzSoFar = state.legs.reduce((acc, l) => acc + l.sz, 0);
             const estimatedFeesTotal = (totalSzSoFar * state.ctVal * state.currentReversePx * FEE_PCT) * 2;
             const neededNext = (state.E_profit + CLOSE_USDT_PROFIT + estimatedFeesTotal) - pnlAtNextTarget;
-            const nextDist = Math.abs(nextTargetPx - newReversePx) * (1 - SLIPPAGE_PCT);
-            const szNext = Math.ceil(neededNext / (nextDist * state.ctVal));
+            
+            const effectiveDistNext = (Math.abs(nextTargetPx - newReversePx) * (1 - SLIPPAGE_PCT)) * state.ctVal;
+            const feeCostPerContractNext = (newReversePx * FEE_PCT) * 2 * state.ctVal;
+            const szNext = Math.ceil(neededNext / (effectiveDistNext - feeCostPerContractNext));
 
             const nextAlgoId = await placeTriggerOrder(sym, nextSide === 'long' ? 'buy' : 'sell', nextSide, newReversePx, szNext);
 
@@ -529,6 +589,20 @@ async function processSymbolHedged(sym: string) {
         // 2. CONSISTENCY CHECK (3 Strikes)
         const { consistent, liveUpl } = await verifyBundleConsistency(sym, state);
         if (!consistent) {
+            // Check if positions were intentionally closed by the exchange (TP/SL)
+            const livePositions = await okxRequest('GET', `/api/v5/account/positions?instId=${sym}`);
+            const totalContracts = livePositions.data?.reduce((acc: number, p: any) => acc + Math.abs(parseInt(p.pos)), 0) || 0;
+
+            if (totalContracts === 0) {
+                tlog(`🏁 [${sym}] No positions on exchange. Cycle finished externally. Cleaning state.`);
+                await cancelAlgoOrder(sym, state.revAlgoId);
+                delete activeState.symbols[sym];
+                delete activeState.mismatches[sym];
+                saveState();
+                logEvent({ sym, action: 'exit_external', details: { msg: 'Exchange closed positions' } });
+                return;
+            }
+
             const count = (activeState.mismatches[sym] || 0) + 1;
             activeState.mismatches[sym] = count;
             if (count < 3) {
@@ -541,6 +615,7 @@ async function processSymbolHedged(sym: string) {
                 delete activeState.symbols[sym];
                 delete activeState.mismatches[sym];
                 saveState();
+                logEvent({ sym, action: 'exit_mismatch', details: { msg: 'Forced close due to sync fail' } });
                 return;
             }
         }
