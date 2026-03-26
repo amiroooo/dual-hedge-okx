@@ -202,9 +202,22 @@ function initWebsocket(symbols: string[]) {
         const pubUrl = IS_SIMULATED ? 'wss://wspap.okx.com:8443/ws/v5/public' : 'wss://ws.okx.com:8443/ws/v5/public';
         tlog(`🔌 Initializing Public WebSocket...`);
         isPubReconnecting = true;
+
+        if (pubWs) { pubWs.removeAllListeners(); pubWs.terminate(); }
         pubWs = new WebSocket(pubUrl);
+        
+        let connectTimeout = setTimeout(() => {
+            if (isPubReconnecting) {
+                tlog("⌛ Public WS Connection timed out. Retrying...");
+                pubWs?.terminate();
+                isPubReconnecting = false;
+                initWebsocket(symbols);
+            }
+        }, 15000);
+
         pubWs.on('open', () => {
             tlog('✅ Public WS Connected.');
+            clearTimeout(connectTimeout);
             isPubReconnecting = false;
             const args = symbols.map(s => ({ channel: 'tickers', instId: s }));
             pubWs?.send(JSON.stringify({ op: 'subscribe', args }));
@@ -219,6 +232,7 @@ function initWebsocket(symbols: string[]) {
         });
         pubWs.on('error', (err) => terror('❌ Public WS Error:', err.message));
         pubWs.on('close', () => {
+            clearTimeout(connectTimeout);
             tlog('⚠️ Public WS Closed. Reconnecting in 10s...');
             setTimeout(() => { isPubReconnecting = false; initWebsocket(symbols); }, 10000);
         });
@@ -229,14 +243,30 @@ function initWebsocket(symbols: string[]) {
         const privUrl = IS_SIMULATED ? 'wss://wspap.okx.com:8443/ws/v5/private' : 'wss://ws.okx.com:8443/ws/v5/private';
         tlog(`🔑 Initializing Private WebSocket...`);
         isPrivReconnecting = true;
+
+        if (privWs) { privWs.removeAllListeners(); privWs.terminate(); }
         privWs = new WebSocket(privUrl);
+        
+        let connectTimeout = setTimeout(() => {
+            if (isPrivReconnecting) {
+                tlog("⌛ Private WS Connection timed out. Retrying...");
+                privWs?.terminate();
+                isPrivReconnecting = false;
+                initWebsocket(symbols);
+            }
+        }, 15000);
+
         privWs.on('open', () => {
             tlog('✅ Private WS Connected. Logging in...');
+            clearTimeout(connectTimeout);
             isPrivReconnecting = false;
-            const timestamp = Math.floor(Date.now() / 1000).toString();
+            
+            const timestamp = (Math.floor(Date.now() / 1000)).toString();
             const method = 'GET';
             const endpoint = '/users/self/verify';
-            const signature = crypto.createHmac('sha256', API_SECRET).update(timestamp + method + endpoint).digest('base64');
+            const prehash = timestamp + method + endpoint;
+            const signature = crypto.createHmac('sha256', API_SECRET).update(prehash).digest('base64');
+            
             privWs?.send(JSON.stringify({
                 op: 'login',
                 args: [{ apiKey: API_KEY, passphrase: API_PASSPHRASE, timestamp, sign: signature }]
@@ -248,6 +278,8 @@ function initWebsocket(symbols: string[]) {
                 if (json.event === 'login' && json.code === '0') {
                     tlog('✅ Private WS Logged in. Subscribing to positions...');
                     privWs?.send(JSON.stringify({ op: 'subscribe', args: [{ channel: 'positions', instType: 'SWAP' }] }));
+                } else if (json.event === 'error') {
+                    terror(`❌ Private WS Event Error: ${json.msg} (Code: ${json.code})`);
                 }
                 if (json.arg?.channel === 'positions' && json.data) {
                     for (const pos of json.data) {
@@ -273,6 +305,7 @@ function initWebsocket(symbols: string[]) {
         });
         privWs.on('error', (err) => terror('❌ Private WS Error:', err.message));
         privWs.on('close', () => {
+            clearTimeout(connectTimeout);
             tlog('⚠️ Private WS Closed. Reconnecting in 10s...');
             setTimeout(() => { isPrivReconnecting = false; initWebsocket(symbols); }, 10000);
         });
