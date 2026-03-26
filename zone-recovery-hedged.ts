@@ -20,7 +20,8 @@ const SYMBOLS = SYMBOLS_RAW.split(',').map(s => s.trim()).filter(s => s.length >
 const MARGIN = Number(process.env.ZR_MARGIN) || 10;
 const LEVERAGE = Number(process.env.ZR_LEVERAGE) || 5;
 const TP_PCT = Number(process.env.ZR_TP_PCT) || 0.01;
-const ZONE_PCT = Number(process.env.ZR_ZONE_PCT) || 0.01;
+const SL_PCT = Number(process.env.ZR_SL_PCT) || 0.02; // New SL Distance
+const REV_RATIO = 0.666; // Reversal at 2/3 of SL distance
 const MAX_REVERSALS = Number(process.env.ZR_MAX_REVERSALS) || 5;
 const POLL_INTERVAL_MS = Number(process.env.ZR_POLL_INTERVAL_MS) || 5000;
 const CLOSE_USDT_PROFIT = Number(process.env.ZR_CLOSE_USDT_PROFIT) || 1.0; 
@@ -46,17 +47,15 @@ interface ZRState {
     ctVal: number;
     P0: number;
     E_profit: number; // Theoretical target profit in USDT
-    D_tp_price: number;
-    D_zone_price: number;
-    P_up_line: number;
-    P_down_line: number;
+    
+    SL_low: number;   // Fixed Low boundary (SL for Longs, TP for Shorts)
+    TP_high: number;  // Fixed High boundary (TP for Longs, SL for Shorts)
 
     legs: Leg[];
     currentReversePx: number;
-    targetPx: number;
     revAlgoId: string;
     tickDecimals: number;
-    lastRevTime?: number; // Timestamp of last reversal to allow sync grace period
+    lastRevTime?: number;
 }
 
 interface ManagerState {
@@ -527,47 +526,41 @@ async function processSymbolHedged(sym: string) {
 
         const side = Math.random() > 0.5 ? 'long' : 'short';
         const sz1 = Math.max(1, Math.floor((MARGIN * actualLever) / (P * ctVal)));
-        tlog(`ℹ️ [${sym}] Target Side: ${side}, Target Size: ${sz1}`);
+        
+        const SL_low = side === 'long' ? round(P * (1 - SL_PCT), tickDecimals) : round(P * (1 - TP_PCT), tickDecimals);
+        const TP_high = side === 'long' ? round(P * (1 + TP_PCT), tickDecimals) : round(P * (1 + SL_PCT), tickDecimals);
 
-        const D_tp_price = P * TP_PCT;
-        const D_zone_price = P * ZONE_PCT;
+        // Standardize boundaries: SL_low is always the "bottom" exit, TP_high is always the "top" exit.
+        // For Longs: TP=TP_high, SL=SL_low. For Shorts: TP=SL_low, SL=TP_high.
+        const tpPx = side === 'long' ? TP_high : SL_low;
+        const slPx = side === 'long' ? SL_low : TP_high;
 
-        const P_up_line = side === 'long' ? P + D_tp_price : P + D_zone_price;
-        const P_down_line = side === 'long' ? P - D_zone_price : P - D_tp_price;
-
-        const tpPx = side === 'long' ? round(P + D_tp_price, tickDecimals) : round(P - D_tp_price, tickDecimals);
-        const slPx = side === 'long' ? round(P - (D_tp_price * 10), tickDecimals) : round(P + (D_tp_price * 10), tickDecimals); // 10x TP distance (Far Safety SL)
         const success = await executeOrder(sym, side === 'long' ? 'buy' : 'sell', side, sz1, tpPx, slPx);
         if (success) {
             const nextSide = side === 'long' ? 'short' : 'long';
-            const reversePx = side === 'long' ? P - D_zone_price : P + D_zone_price;
-            const targetPx = side === 'long' ? P + D_tp_price : P - D_tp_price;
-
-            // Pre-calculate Leg 2 size
-            const newTargetPx = nextSide === 'short' ? P - D_zone_price - D_tp_price : P + D_zone_price + D_tp_price;
-            const currentPnlAtNewTarget = (side === 'long' ? (newTargetPx - P) : (P - newTargetPx)) * sz1 * ctVal;
+            const reversePx = side === 'long' 
+                ? round(P - (P * SL_PCT * REV_RATIO), tickDecimals) 
+                : round(P + (P * SL_PCT * REV_RATIO), tickDecimals);
             
-            // Step-by-step math for Leg 2
+            const nextTargetPx = nextSide === 'long' ? TP_high : SL_low;
+            
+            // PnL of Leg 1 at Leg 2's target
+            const pnl1AtTarget = (side === 'long' ? (nextTargetPx - P) : (P - nextTargetPx)) * sz1 * ctVal;
             const prevLegsFees = (sz1 * ctVal * P * FEE_PCT) * 2;
-            const targetUSDT = (D_tp_price * sz1 * ctVal) + CLOSE_USDT_PROFIT + prevLegsFees;
-            const netNeeded = targetUSDT - currentPnlAtNewTarget;
+            const targetUSDT = (Math.abs(tpPx - P) * sz1 * ctVal) + CLOSE_USDT_PROFIT + prevLegsFees;
+            const netNeeded = targetUSDT - pnl1AtTarget;
             
-            const effectiveDist = (Math.abs(newTargetPx - reversePx) * (1 - SLIPPAGE_PCT)) * ctVal;
+            const effectiveDist = (Math.abs(nextTargetPx - reversePx) * (1 - SLIPPAGE_PCT)) * ctVal;
             const feeCostPerContract = (reversePx * FEE_PCT) * 2 * ctVal;
-            const den = effectiveDist - feeCostPerContract;
-            
-            const sz2 = Math.ceil((netNeeded / den) * MATH_BUFFER);
-
-            tlog(`🧪 [${sym}] Leg 2 Math: Target:$${targetUSDT.toFixed(2)}, Current:$${currentPnlAtNewTarget.toFixed(2)}, Needed:$${netNeeded.toFixed(2)}, Sz:${sz2}`);
+            const sz2 = Math.ceil((netNeeded / (effectiveDist - feeCostPerContract)) * MATH_BUFFER);
 
             const revAlgoId = await placeTriggerOrder(sym, nextSide === 'long' ? 'buy' : 'sell', nextSide, reversePx, sz2);
 
             activeState.symbols[sym] = {
-                ctVal, P0: P, E_profit: D_tp_price * sz1 * ctVal,
-                D_tp_price, D_zone_price, P_up_line, P_down_line,
+                ctVal, P0: P, E_profit: Math.abs(tpPx - P) * sz1 * ctVal,
+                SL_low, TP_high,
                 legs: [{ side, entryPx: P, sz: sz1 }],
                 currentReversePx: reversePx,
-                targetPx,
                 revAlgoId: revAlgoId || 'manual',
                 tickDecimals
             };
@@ -584,55 +577,63 @@ async function processSymbolHedged(sym: string) {
         const nextSide = currentSide === 'long' ? 'short' : 'long';
 
         // Check if next leg is already visible on exchange
-        let externalReversalDetected = false;
+        let externalReversed = false;
         if (nextSide === 'long' && liveLong > (state.legs.filter(l => l.side === 'long').reduce((acc, l) => acc + l.sz, 0))) {
-            externalReversalDetected = true;
+            externalReversed = true;
         } else if (nextSide === 'short' && liveShort > (state.legs.filter(l => l.side === 'short').reduce((acc, l) => acc + l.sz, 0))) {
-            externalReversalDetected = true;
+            externalReversed = true;
         }
 
         const revStatus = await checkAlgoStatus(sym, state.revAlgoId);
-        if (revStatus === 'effective' || externalReversalDetected) {
+        if (revStatus === 'effective' || externalReversed) {
+            if (state.legs.length >= MAX_REVERSALS) {
+                tlog(`⚠️ [${sym}] Max Reversals (${MAX_REVERSALS}) reached. No more hedging. Waiting for SL/TP.`);
+                return;
+            }
             tlog(`\n🔄 [${sym}] REVERSAL DETECTED! (Status: ${revStatus || 'external/positions'})...`);
             
-            // Calculate new leg info (using same math as placement)
+            // MATH FOR BOUND STRATEGY:
+            // Sz_new = (Target_USDT - Current_PnL_at_Target) / Distance_to_Target
             const tickDecimals = state.tickDecimals;
-            const newTargetPx = Number((nextSide === 'short' ? state.P_down_line - state.D_tp_price : state.P_up_line + state.D_tp_price).toFixed(tickDecimals));
-            const newReversePx = Number((nextSide === 'short' ? state.P_up_line : state.P_down_line).toFixed(tickDecimals));
+            const nextTargetPx = nextSide === 'long' ? state.TP_high : state.SL_low;
+            const nextStopPx = nextSide === 'long' ? state.SL_low : state.TP_high;
 
-            let currentPnlAtNewTarget = 0;
+            let pnlAtTarget = 0;
             for (const leg of state.legs) {
-                if (leg.side === 'long') currentPnlAtNewTarget += (newTargetPx - leg.entryPx) * leg.sz * state.ctVal;
-                else currentPnlAtNewTarget += (leg.entryPx - newTargetPx) * leg.sz * state.ctVal;
+                if (leg.side === 'long') pnlAtTarget += (nextTargetPx - leg.entryPx) * leg.sz * state.ctVal;
+                else pnlAtTarget += (leg.entryPx - nextTargetPx) * leg.sz * state.ctVal;
             }
+            
             const totalSzCurrently = state.legs.reduce((acc, l) => acc + l.sz, 0);
             const estFeesPrev = (totalSzCurrently * state.ctVal * state.currentReversePx * FEE_PCT) * 2;
             const targetUSDT = state.E_profit + CLOSE_USDT_PROFIT + estFeesPrev;
-            const netNeeded = targetUSDT - currentPnlAtNewTarget;
-            const effectiveDist = (Math.abs(newTargetPx - state.currentReversePx) * (1 - SLIPPAGE_PCT)) * state.ctVal;
+            const netNeeded = targetUSDT - pnlAtTarget;
+            
+            const effectiveDist = (Math.abs(nextTargetPx - state.currentReversePx) * (1 - SLIPPAGE_PCT)) * state.ctVal;
             const feeCostPerContract = (state.currentReversePx * FEE_PCT) * 2 * state.ctVal;
             const sz = Math.ceil((netNeeded / (effectiveDist - feeCostPerContract)) * MATH_BUFFER);
+
+            tlog(`🧪 [${sym}] Leg ${state.legs.length + 1} Sizing: NetNeeded:$${netNeeded.toFixed(2)}, Sz:${sz}`);
 
             // Update state with the new leg
             state.legs.push({ side: nextSide, entryPx: state.currentReversePx, sz });
             
+            // Re-attach hard TP/SL for the new position (in case external trigger didn't have them)
+            await okxRequest('POST', '/api/v5/trade/order-algo', {
+                instId: sym, tdMode: 'isolated', posSide: nextSide, side: nextSide === 'long' ? 'buy' : 'sell',
+                ordType: 'conditional', sz: sz.toString(),
+                slTriggerPx: nextStopPx.toString(), slOrdPx: '-1',
+                tpTriggerPx: nextTargetPx.toString(), tpOrdPx: '-1'
+            });
+
+            // Prepare NEXT reversal
             const nextSideReversed = nextSide === 'long' ? 'short' : 'long';
-            const nextTargetPx = nextSideReversed === 'short' ? state.P_down_line - state.D_tp_price : state.P_up_line + state.D_tp_price;
-            const pnlAtNextTarget = state.legs.reduce((acc, l) => {
-                const diff = l.side === 'long' ? (nextTargetPx - l.entryPx) : (l.entryPx - nextTargetPx);
-                return acc + (diff * l.sz * state.ctVal);
-            }, 0);
+            const newReversePx = nextSide === 'long' 
+                ? round(state.P0 + (state.SL_low - state.P0) * (1 - REV_RATIO), tickDecimals) 
+                : round(state.P0 + (state.TP_high - state.P0) * (1 - REV_RATIO), tickDecimals);
 
-            const totalSzSoFar = state.legs.reduce((acc, l) => acc + l.sz, 0);
-            const estimatedFeesTotal = (totalSzSoFar * state.ctVal * state.currentReversePx * FEE_PCT) * 2;
-            const neededNext = (state.E_profit + CLOSE_USDT_PROFIT + estimatedFeesTotal) - pnlAtNextTarget;
-            const effectiveDistNext = (Math.abs(nextTargetPx - newReversePx) * (1 - SLIPPAGE_PCT)) * state.ctVal;
-            const feeCostPerContractNext = (newReversePx * FEE_PCT) * 2 * state.ctVal;
-            const szNext = Math.ceil((neededNext / (effectiveDistNext - feeCostPerContractNext)) * MATH_BUFFER);
-
-            const nextAlgoId = await placeTriggerOrder(sym, nextSideReversed === 'long' ? 'buy' : 'sell', nextSideReversed, newReversePx, szNext);
-
-            state.targetPx = newTargetPx;
+            const nextAlgoId = await placeTriggerOrder(sym, nextSideReversed === 'long' ? 'buy' : 'sell', nextSideReversed, newReversePx, 1); // Sz will be recalculated on trigger
+            
             state.currentReversePx = newReversePx;
             state.revAlgoId = nextAlgoId || 'manual';
             state.lastRevTime = Date.now();
