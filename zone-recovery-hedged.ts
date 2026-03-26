@@ -68,6 +68,10 @@ const priceCache: Record<string, number> = {};
 interface PosInfo { sz: number; upl: number; lastUpdate: number; }
 const positionCache: Record<string, { long: PosInfo, short: PosInfo }> = {};
 const cooldowns: Record<string, number> = {};
+let pubWs: WebSocket | null = null;
+let privWs: WebSocket | null = null;
+let isPubReconnecting = false;
+let isPrivReconnecting = false;
 
 function round(val: number, decimals: number): number {
     return Number(val.toFixed(decimals));
@@ -194,86 +198,92 @@ async function getTickerPrice(instId: string): Promise<number> {
 
 function initWebsocket(symbols: string[]) {
     // 1. PUBLIC WS (Tickers)
-    const pubUrl = IS_SIMULATED ? 'wss://wspap.okx.com:8443/ws/v5/public' : 'wss://ws.okx.com:8443/ws/v5/public';
-    tlog(`🔌 Initializing Public WebSocket...`);
-    const pubWs = new WebSocket(pubUrl);
-    pubWs.on('open', () => {
-        tlog('✅ Public WS Connected.');
-        const args = symbols.map(s => ({ channel: 'tickers', instId: s }));
-        pubWs.send(JSON.stringify({ op: 'subscribe', args }));
-    });
-    pubWs.on('message', (data) => {
-        try {
-            const json = JSON.parse(data.toString());
-            if (json.arg?.channel === 'tickers' && json.data?.[0]?.last) {
-                priceCache[json.arg.instId] = parseFloat(json.data[0].last);
-            }
-        } catch (e) {}
-    });
-    pubWs.on('error', (err) => terror('❌ Public WS Error:', err.message));
-    pubWs.on('close', () => setTimeout(() => initWebsocket(symbols), 5000));
+    if (!isPubReconnecting) {
+        const pubUrl = IS_SIMULATED ? 'wss://wspap.okx.com:8443/ws/v5/public' : 'wss://ws.okx.com:8443/ws/v5/public';
+        tlog(`🔌 Initializing Public WebSocket...`);
+        isPubReconnecting = true;
+        pubWs = new WebSocket(pubUrl);
+        pubWs.on('open', () => {
+            tlog('✅ Public WS Connected.');
+            isPubReconnecting = false;
+            const args = symbols.map(s => ({ channel: 'tickers', instId: s }));
+            pubWs?.send(JSON.stringify({ op: 'subscribe', args }));
+        });
+        pubWs.on('message', (data) => {
+            try {
+                const json = JSON.parse(data.toString());
+                if (json.arg?.channel === 'tickers' && json.data?.[0]?.last) {
+                    priceCache[json.arg.instId] = parseFloat(json.data[0].last);
+                }
+            } catch (e) {}
+        });
+        pubWs.on('error', (err) => terror('❌ Public WS Error:', err.message));
+        pubWs.on('close', () => {
+            tlog('⚠️ Public WS Closed. Reconnecting in 10s...');
+            setTimeout(() => { isPubReconnecting = false; initWebsocket(symbols); }, 10000);
+        });
+    }
 
     // 2. PRIVATE WS (Positions)
-    const privUrl = IS_SIMULATED ? 'wss://wspap.okx.com:8443/ws/v5/private' : 'wss://ws.okx.com:8443/ws/v5/private';
-    tlog(`🔑 Initializing Private WebSocket...`);
-    const privWs = new WebSocket(privUrl);
-    
-    privWs.on('open', () => {
-        tlog('✅ Private WS Connected. Logging in...');
-        const timestamp = Math.floor(Date.now() / 1000).toString();
-        const method = 'GET';
-        const endpoint = '/users/self/verify';
-        const signature = crypto.createHmac('sha256', API_SECRET).update(timestamp + method + endpoint).digest('base64');
-        privWs.send(JSON.stringify({
-            op: 'login',
-            args: [{ apiKey: API_KEY, passphrase: API_PASSPHRASE, timestamp, sign: signature }]
-        }));
-    });
-
-    privWs.on('message', (data) => {
-        try {
-            const json = JSON.parse(data.toString());
-            if (json.event === 'login' && json.code === '0') {
-                tlog('✅ Private WS Logged in. Subscribing to positions...');
-                privWs.send(JSON.stringify({ op: 'subscribe', args: [{ channel: 'positions', instType: 'SWAP' }] }));
-            }
-            if (json.arg?.channel === 'positions' && json.data) {
-                for (const pos of json.data) {
-                    const sym = pos.instId;
-                    if (!positionCache[sym]) {
-                        positionCache[sym] = { 
-                            long: { sz: 0, upl:0, lastUpdate: 0 }, 
-                            short: { sz: 0, upl: 0, lastUpdate: 0 } 
-                        };
-                    }
-                    const side = pos.posSide;
-                    if (side === 'long' || side === 'short') {
-                        const s = side as 'long' | 'short';
-                        positionCache[sym][s] = { 
-                            sz: Math.abs(parseInt(pos.pos)), 
-                            upl: parseFloat(pos.upl || '0'),
-                            lastUpdate: Date.now()
-                        };
-                    } else if (side === 'net') {
-                        // In net mode (if encountered), we can't easily map to our hedge bot
+    if (!isPrivReconnecting) {
+        const privUrl = IS_SIMULATED ? 'wss://wspap.okx.com:8443/ws/v5/private' : 'wss://ws.okx.com:8443/ws/v5/private';
+        tlog(`🔑 Initializing Private WebSocket...`);
+        isPrivReconnecting = true;
+        privWs = new WebSocket(privUrl);
+        privWs.on('open', () => {
+            tlog('✅ Private WS Connected. Logging in...');
+            isPrivReconnecting = false;
+            const timestamp = Math.floor(Date.now() / 1000).toString();
+            const method = 'GET';
+            const endpoint = '/users/self/verify';
+            const signature = crypto.createHmac('sha256', API_SECRET).update(timestamp + method + endpoint).digest('base64');
+            privWs?.send(JSON.stringify({
+                op: 'login',
+                args: [{ apiKey: API_KEY, passphrase: API_PASSPHRASE, timestamp, sign: signature }]
+            }));
+        });
+        privWs.on('message', (data) => {
+            try {
+                const json = JSON.parse(data.toString());
+                if (json.event === 'login' && json.code === '0') {
+                    tlog('✅ Private WS Logged in. Subscribing to positions...');
+                    privWs?.send(JSON.stringify({ op: 'subscribe', args: [{ channel: 'positions', instType: 'SWAP' }] }));
+                }
+                if (json.arg?.channel === 'positions' && json.data) {
+                    for (const pos of json.data) {
+                        const sym = pos.instId;
+                        if (!positionCache[sym]) {
+                            positionCache[sym] = { 
+                                long: { sz: 0, upl:0, lastUpdate: 0 }, 
+                                short: { sz: 0, upl: 0, lastUpdate: 0 } 
+                            };
+                        }
+                        const side = pos.posSide;
+                        if (side === 'long' || side === 'short') {
+                            const s = side as 'long' | 'short';
+                            positionCache[sym][s] = { 
+                                sz: Math.abs(parseInt(pos.pos)), 
+                                upl: parseFloat(pos.upl || '0'),
+                                lastUpdate: Date.now()
+                            };
+                        }
                     }
                 }
-            }
-        } catch (e) {}
-    });
-
-    privWs.on('error', (err) => terror('❌ Private WS Error:', err.message));
-    privWs.on('close', () => {
-        tlog('⚠️ Private WS Closed. Reconnecting in 5s...');
-        setTimeout(initWebsocket, 5000);
-    });
-
-    // Keepalive & Heartbeat
-    setInterval(() => {
-        if (pubWs.readyState === WebSocket.OPEN) pubWs.send('ping');
-        if (privWs.readyState === WebSocket.OPEN) privWs.send('ping');
-    }, 20000);
+            } catch (e) {}
+        });
+        privWs.on('error', (err) => terror('❌ Private WS Error:', err.message));
+        privWs.on('close', () => {
+            tlog('⚠️ Private WS Closed. Reconnecting in 10s...');
+            setTimeout(() => { isPrivReconnecting = false; initWebsocket(symbols); }, 10000);
+        });
+    }
 }
+
+// Global Keepalive
+setInterval(() => {
+    if (pubWs?.readyState === WebSocket.OPEN) pubWs.send('ping');
+    if (privWs?.readyState === WebSocket.OPEN) privWs.send('ping');
+}, 20000);
 
 async function setAccountMode() {
     // 1. Check current mode
