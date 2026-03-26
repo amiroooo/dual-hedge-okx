@@ -21,13 +21,13 @@ const MARGIN = Number(process.env.ZR_MARGIN) || 10;
 const LEVERAGE = Number(process.env.ZR_LEVERAGE) || 5;
 const TP_PCT = Number(process.env.ZR_TP_PCT) || 0.01;
 const SL_PCT = Number(process.env.ZR_SL_PCT) || 0.02; // New SL Distance
-const REV_RATIO = 0.666; // Reversal at 2/3 of SL distance
+const REV_RATIO = 0.5; // Reversal at 50% (Midpoint)
 const MAX_REVERSALS = Number(process.env.ZR_MAX_REVERSALS) || 5;
 const POLL_INTERVAL_MS = Number(process.env.ZR_POLL_INTERVAL_MS) || 5000;
 const CLOSE_USDT_PROFIT = Number(process.env.ZR_CLOSE_USDT_PROFIT) || 1.0; 
 const FEE_PCT = 0.0008; // 0.08% estimated taker fee (Very Conservative)
 const SLIPPAGE_PCT = 0.0010; // 0.10% slippage buffer (Aggressive)
-const MATH_BUFFER = Number(process.env.ZR_MATH_BUFFER) || 1.1; // 10% extra size for safety
+const MATH_BUFFER = Number(process.env.ZR_MATH_BUFFER) || 1.05; // 5% extra size for safety
 
 const BASE_URL = 'https://www.okx.com';
 const STATE_FILE = '.zr-hedged-state.json';
@@ -273,8 +273,16 @@ function initWebsocket(symbols: string[]) {
             }));
         });
         privWs.on('message', (data) => {
-            try {
-                const json = JSON.parse(data.toString());
+        try {
+            const dataStr = data.toString();
+            if (dataStr === 'pong') {
+                for (const s in positionCache) {
+                    positionCache[s].long.lastUpdate = Date.now();
+                    positionCache[s].short.lastUpdate = Date.now();
+                }
+                return;
+            }
+            const json = JSON.parse(dataStr);
                 if (json.event === 'login' && json.code === '0') {
                     tlog('✅ Private WS Logged in. Subscribing to positions...');
                     privWs?.send(JSON.stringify({ op: 'subscribe', args: [{ channel: 'positions', instType: 'SWAP' }] }));
@@ -317,6 +325,17 @@ setInterval(() => {
     if (pubWs?.readyState === WebSocket.OPEN) pubWs.send('ping');
     if (privWs?.readyState === WebSocket.OPEN) privWs.send('ping');
 }, 20000);
+
+function initializePositionCache(symbols: string[]) {
+    for (const sym of symbols) {
+        if (!positionCache[sym]) {
+            positionCache[sym] = { 
+                long: { sz: 0, upl:0, lastUpdate: Date.now() }, 
+                short: { sz: 0, upl: 0, lastUpdate: Date.now() } 
+            };
+        }
+    }
+}
 
 async function setAccountMode() {
     // 1. Check current mode
@@ -537,6 +556,9 @@ async function runHedgedManager() {
     await setAccountMode();
     loadState();
     
+    // START REAL-TIME POSITION CACHE
+    initializePositionCache(SYMBOLS);
+
     // START REAL-TIME PRICE FEED
     initWebsocket(SYMBOLS);
 
@@ -690,11 +712,9 @@ async function processSymbolHedged(sym: string) {
                 tpTriggerPx: nextTargetPx.toString(), tpOrdPx: '-1'
             });
 
-            // Prepare NEXT reversal
+            // Prepare NEXT reversal (Always at the SAME price line)
+            const newReversePx = state.currentReversePx; 
             const nextSideReversed = nextSide === 'long' ? 'short' : 'long';
-            const newReversePx = nextSide === 'long' 
-                ? round(state.P0 + (state.SL_low - state.P0) * (1 - REV_RATIO), tickDecimals) 
-                : round(state.P0 + (state.TP_high - state.P0) * (1 - REV_RATIO), tickDecimals);
 
             const nextAlgoId = await placeTriggerOrder(sym, nextSideReversed === 'long' ? 'buy' : 'sell', nextSideReversed, newReversePx, 1); // Sz will be recalculated on trigger
             
