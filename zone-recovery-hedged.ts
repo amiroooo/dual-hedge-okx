@@ -65,8 +65,9 @@ interface ManagerState {
 
 let activeState: ManagerState = { symbols: {}, mismatches: {} };
 const priceCache: Record<string, number> = {};
-interface PosInfo { sz: number; upl: number; }
+interface PosInfo { sz: number; upl: number; lastUpdate: number; }
 const positionCache: Record<string, { long: PosInfo, short: PosInfo }> = {};
+const cooldowns: Record<string, number> = {};
 
 function round(val: number, decimals: number): number {
     return Number(val.toFixed(decimals));
@@ -240,14 +241,18 @@ function initWebsocket(symbols: string[]) {
                 for (const pos of json.data) {
                     const sym = pos.instId;
                     if (!positionCache[sym]) {
-                        positionCache[sym] = { long: { sz: 0, upl:0 }, short: { sz: 0, upl: 0 } };
+                        positionCache[sym] = { 
+                            long: { sz: 0, upl:0, lastUpdate: 0 }, 
+                            short: { sz: 0, upl: 0, lastUpdate: 0 } 
+                        };
                     }
                     const side = pos.posSide;
                     if (side === 'long' || side === 'short') {
                         const s = side as 'long' | 'short';
                         positionCache[sym][s] = { 
                             sz: Math.abs(parseInt(pos.pos)), 
-                            upl: parseFloat(pos.upl || '0') 
+                            upl: parseFloat(pos.upl || '0'),
+                            lastUpdate: Date.now()
                         };
                     } else if (side === 'net') {
                         // In net mode (if encountered), we can't easily map to our hedge bot
@@ -258,9 +263,12 @@ function initWebsocket(symbols: string[]) {
     });
 
     privWs.on('error', (err) => terror('❌ Private WS Error:', err.message));
-    privWs.on('close', () => tlog('⚠️ Private WS Closed.'));
+    privWs.on('close', () => {
+        tlog('⚠️ Private WS Closed. Reconnecting in 5s...');
+        setTimeout(initWebsocket, 5000);
+    });
 
-    // Keepalive
+    // Keepalive & Heartbeat
     setInterval(() => {
         if (pubWs.readyState === WebSocket.OPEN) pubWs.send('ping');
         if (privWs.readyState === WebSocket.OPEN) privWs.send('ping');
@@ -434,11 +442,19 @@ async function verifyBundleConsistencyExtended(sym: string, state: ZRState): Pro
     let liveShort = 0;
     let liveUpl = 0;
 
-    if (positionCache[sym]) {
-        liveLong = positionCache[sym].long.sz;
-        liveShort = positionCache[sym].short.sz;
-        liveUpl = positionCache[sym].long.upl + positionCache[sym].short.upl;
+    const cacheEntry = positionCache[sym];
+    const stalenessLimit = 30000; // 30s
+    const now = Date.now();
+    
+    const longStale = !cacheEntry || (now - cacheEntry.long.lastUpdate > stalenessLimit);
+    const shortStale = !cacheEntry || (now - cacheEntry.short.lastUpdate > stalenessLimit);
+
+    if (cacheEntry && !longStale && !shortStale) {
+        liveLong = cacheEntry.long.sz;
+        liveShort = cacheEntry.short.sz;
+        liveUpl = cacheEntry.long.upl + cacheEntry.short.upl;
     } else {
+        if (cacheEntry) tlog(`📡 [${sym}] WebSocket stale (Long: ${now - cacheEntry.long.lastUpdate}ms). Falling back to REST for sync.`);
         const res = await okxRequest('GET', `/api/v5/account/positions?instId=${sym}`);
         if (!res || res.code !== '0') return { consistent: true, liveUpl: 0, liveLong: 0, liveShort: 0 };
         for (const pos of res.data) {
@@ -515,6 +531,11 @@ async function processSymbolHedged(sym: string) {
         const ctVal = parseFloat(res.data[0].ctVal);
         const tickSz = res.data[0].tickSz;
         
+        // Cooldown check to prevent rapid death loops
+        if (cooldowns[sym] && Date.now() < cooldowns[sym]) {
+            return;
+        }
+
         // 0. Clean the slate first (Cancel all triggers/SLs to allow leverage change)
         await cancelAllAlgoOrders(sym);
 
@@ -663,11 +684,12 @@ async function processSymbolHedged(sym: string) {
                 tlog(`⚠️ [${sym}] Consistency Mismatch! OKX:L:${liveLong} S:${liveShort} | JSON:L:${(state.legs.filter(l=>l.side==='long').reduce((a,l)=>a+l.sz,0))} S:${(state.legs.filter(l=>l.side==='short').reduce((a,l)=>a+l.sz,0))} (${count}/12)`);
                 return;
             } else {
-                tlog(`❌ [${sym}] Out of sync. FORCING CLOSE ALL.`);
+                tlog(`❌ [${sym}] Out of sync. FORCING CLOSE ALL. (Cooldown 60s)`);
                 await cancelAllAlgoOrders(sym);
                 await closeAllPositions(sym);
                 delete activeState.symbols[sym];
                 delete activeState.mismatches[sym];
+                cooldowns[sym] = Date.now() + 60000; // 1 min cooldown
                 saveState();
                 logEvent({ sym, action: 'exit_mismatch', details: { msg: 'Forced close' } });
                 return;
