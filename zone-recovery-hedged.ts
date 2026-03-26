@@ -3,6 +3,7 @@ import * as crypto from 'crypto';
 import * as dotenv from 'dotenv';
 import * as fs from 'fs';
 import WebSocket from 'ws';
+import * as readline from 'readline';
 
 dotenv.config();
 
@@ -24,7 +25,7 @@ const SL_PCT = Number(process.env.ZR_SL_PCT) || 0.02; // New SL Distance
 const REV_RATIO = 0.5; // Reversal at 50% (Midpoint)
 const MAX_REVERSALS = Number(process.env.ZR_MAX_REVERSALS) || 5;
 const POLL_INTERVAL_MS = Number(process.env.ZR_POLL_INTERVAL_MS) || 5000;
-const CLOSE_USDT_PROFIT = Number(process.env.ZR_CLOSE_USDT_PROFIT) || 1.0; 
+const CLOSE_USDT_PROFIT = Number(process.env.ZR_CLOSE_USDT_PROFIT) || 1.0;
 const FEE_PCT = 0.0008; // 0.08% estimated taker fee (Very Conservative)
 const SLIPPAGE_PCT = 0.0010; // 0.10% slippage buffer (Aggressive)
 const MATH_BUFFER = Number(process.env.ZR_MATH_BUFFER) || 1.05; // 5% extra size for safety
@@ -34,6 +35,7 @@ const STATE_FILE = '.zr-hedged-state.json';
 const PERF_LOG = 'zr-hedged-performance.json';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const CONFIG_FILE = 'zr-config.json';
 
 // ==========================================
 // 2. STATE MANAGEMENT
@@ -47,7 +49,7 @@ interface ZRState {
     ctVal: number;
     P0: number;
     E_profit: number; // Theoretical target profit in USDT
-    
+
     SL_low: number;   // Fixed Low boundary (SL for Longs, TP for Shorts)
     TP_high: number;  // Fixed High boundary (TP for Longs, SL for Shorts)
 
@@ -56,6 +58,35 @@ interface ZRState {
     revAlgoId: string;
     tickDecimals: number;
     lastRevTime?: number;
+
+    // Per-pair config captured at cycle start
+    leverage: number;
+    margin: number;
+}
+
+interface ConfigPair {
+    instId: string;
+    leverage: number;
+    margin: number;
+}
+interface ZRConfig {
+    pairs: ConfigPair[];
+}
+
+let zrConfig: ZRConfig = { pairs: [] };
+function loadConfig() {
+    try {
+        if (fs.existsSync(CONFIG_FILE)) {
+            zrConfig = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
+            tlog(`📖 Config loaded: ${zrConfig.pairs.length} pairs defined.`);
+        } else {
+            tlog(`ℹ️ No ${CONFIG_FILE} found. Using .env defaults.`);
+            SYMBOLS.forEach(s => zrConfig.pairs.push({ instId: s, leverage: LEVERAGE, margin: MARGIN }));
+        }
+    } catch (e) {
+        terror(`❌ Error loading config:`, e);
+        SYMBOLS.forEach(s => zrConfig.pairs.push({ instId: s, leverage: LEVERAGE, margin: MARGIN }));
+    }
 }
 
 interface ManagerState {
@@ -129,7 +160,7 @@ async function sendTelegramMessage(text: string) {
         // Clean token: common error is adding 'bot' prefix manually in .env
         const token = TELEGRAM_TOKEN.trim();
         const apiPath = token.startsWith('bot') ? token : `bot${token}`;
-        
+
         await axios.post(`https://api.telegram.org/${apiPath}/sendMessage`, {
             chat_id: TELEGRAM_CHAT_ID.trim(),
             text,
@@ -205,7 +236,7 @@ function initWebsocket(symbols: string[]) {
 
         if (pubWs) { pubWs.removeAllListeners(); pubWs.terminate(); }
         pubWs = new WebSocket(pubUrl);
-        
+
         let connectTimeout = setTimeout(() => {
             if (isPubReconnecting) {
                 tlog("⌛ Public WS Connection timed out. Retrying...");
@@ -228,7 +259,7 @@ function initWebsocket(symbols: string[]) {
                 if (json.arg?.channel === 'tickers' && json.data?.[0]?.last) {
                     priceCache[json.arg.instId] = parseFloat(json.data[0].last);
                 }
-            } catch (e) {}
+            } catch (e) { }
         });
         pubWs.on('error', (err) => terror('❌ Public WS Error:', err.message));
         pubWs.on('close', () => {
@@ -246,7 +277,7 @@ function initWebsocket(symbols: string[]) {
 
         if (privWs) { privWs.removeAllListeners(); privWs.terminate(); }
         privWs = new WebSocket(privUrl);
-        
+
         let connectTimeout = setTimeout(() => {
             if (isPrivReconnecting) {
                 tlog("⌛ Private WS Connection timed out. Retrying...");
@@ -260,29 +291,29 @@ function initWebsocket(symbols: string[]) {
             tlog('✅ Private WS Connected. Logging in...');
             clearTimeout(connectTimeout);
             isPrivReconnecting = false;
-            
+
             const timestamp = (Math.floor(Date.now() / 1000)).toString();
             const method = 'GET';
             const endpoint = '/users/self/verify';
             const prehash = timestamp + method + endpoint;
             const signature = crypto.createHmac('sha256', API_SECRET).update(prehash).digest('base64');
-            
+
             privWs?.send(JSON.stringify({
                 op: 'login',
                 args: [{ apiKey: API_KEY, passphrase: API_PASSPHRASE, timestamp, sign: signature }]
             }));
         });
         privWs.on('message', (data) => {
-        try {
-            const dataStr = data.toString();
-            if (dataStr === 'pong') {
-                for (const s in positionCache) {
-                    positionCache[s].long.lastUpdate = Date.now();
-                    positionCache[s].short.lastUpdate = Date.now();
+            try {
+                const dataStr = data.toString();
+                if (dataStr === 'pong') {
+                    for (const s in positionCache) {
+                        positionCache[s].long.lastUpdate = Date.now();
+                        positionCache[s].short.lastUpdate = Date.now();
+                    }
+                    return;
                 }
-                return;
-            }
-            const json = JSON.parse(dataStr);
+                const json = JSON.parse(dataStr);
                 if (json.event === 'login' && json.code === '0') {
                     tlog('✅ Private WS Logged in. Subscribing to positions...');
                     privWs?.send(JSON.stringify({ op: 'subscribe', args: [{ channel: 'positions', instType: 'SWAP' }] }));
@@ -293,23 +324,23 @@ function initWebsocket(symbols: string[]) {
                     for (const pos of json.data) {
                         const sym = pos.instId;
                         if (!positionCache[sym]) {
-                            positionCache[sym] = { 
-                                long: { sz: 0, upl:0, lastUpdate: 0 }, 
-                                short: { sz: 0, upl: 0, lastUpdate: 0 } 
+                            positionCache[sym] = {
+                                long: { sz: 0, upl: 0, lastUpdate: 0 },
+                                short: { sz: 0, upl: 0, lastUpdate: 0 }
                             };
                         }
                         const side = pos.posSide;
                         if (side === 'long' || side === 'short') {
                             const s = side as 'long' | 'short';
-                            positionCache[sym][s] = { 
-                                sz: Math.abs(parseInt(pos.pos)), 
+                            positionCache[sym][s] = {
+                                sz: Math.abs(parseInt(pos.pos)),
                                 upl: parseFloat(pos.upl || '0'),
                                 lastUpdate: Date.now()
                             };
                         }
                     }
                 }
-            } catch (e) {}
+            } catch (e) { }
         });
         privWs.on('error', (err) => terror('❌ Private WS Error:', err.message));
         privWs.on('close', () => {
@@ -329,9 +360,9 @@ setInterval(() => {
 function initializePositionCache(symbols: string[]) {
     for (const sym of symbols) {
         if (!positionCache[sym]) {
-            positionCache[sym] = { 
-                long: { sz: 0, upl:0, lastUpdate: Date.now() }, 
-                short: { sz: 0, upl: 0, lastUpdate: Date.now() } 
+            positionCache[sym] = {
+                long: { sz: 0, upl: 0, lastUpdate: Date.now() },
+                short: { sz: 0, upl: 0, lastUpdate: Date.now() }
             };
         }
     }
@@ -398,7 +429,7 @@ async function closeAllPositions(instId: string) {
 
 async function setLeverage(instId: string, lever: number): Promise<number> {
     tlog(`⚙️ [${instId}] Syncing leverage (${lever}x)...`);
-    
+
     // 1. Fetch current leverage info to avoid redundant (and failing) calls
     const infoRes = await okxRequest('GET', `/api/v5/account/leverage-info?instId=${instId}&mgnMode=isolated`);
     const liveLeverageMap: Record<string, number> = {};
@@ -409,7 +440,7 @@ async function setLeverage(instId: string, lever: number): Promise<number> {
     }
 
     let finalLever = lever;
-    const sides: ('long'|'short')[] = ['long', 'short'];
+    const sides: ('long' | 'short')[] = ['long', 'short'];
     for (const posSide of sides) {
         const current = liveLeverageMap[posSide];
         if (current === lever) {
@@ -421,7 +452,7 @@ async function setLeverage(instId: string, lever: number): Promise<number> {
         const res = await okxRequest('POST', '/api/v5/account/set-leverage', {
             instId, lever: lever.toString(), mgnMode: 'isolated', posSide
         });
-        
+
         if (res.code !== '0') {
             terror(`⚠️ [${instId}] Failed to set leverage for ${posSide}: ${res.msg}`);
             tlog(`💡 [${instId}] Tip: If you have an active position, OKX might block leverage changes.`);
@@ -437,7 +468,7 @@ async function setLeverage(instId: string, lever: number): Promise<number> {
     return finalLever;
 }
 
-async function placeTriggerOrder(instId: string, side: 'buy'|'sell', posSide: 'long'|'short', triggerPx: number, sz: number): Promise<string | null> {
+async function placeTriggerOrder(instId: string, side: 'buy' | 'sell', posSide: 'long' | 'short', triggerPx: number, sz: number): Promise<string | null> {
     tlog(`🚀 [${instId}] Placing Trigger Order: ${side.toUpperCase()} ${sz} at ${triggerPx} (posSide: ${posSide})`);
     const res = await okxRequest('POST', '/api/v5/trade/order-algo', {
         instId, tdMode: 'isolated', side, posSide, ordType: 'trigger', triggerPx: triggerPx.toString(), orderPx: '-1', sz: sz.toString()
@@ -452,38 +483,81 @@ async function cancelAlgoOrder(instId: string, algoId: string) {
     await okxRequest('POST', '/api/v5/trade/cancel-algos', [{ instId, algoId }]);
 }
 
+async function performGlobalCleanup() {
+    tlog(`🧼 [GLOBAL] Performing account-wide DEEP order cleanup...`);
+
+    // 1. Regular Orders
+    const regRes = await okxRequest('GET', `/api/v5/trade/orders-pending`);
+    if (regRes && regRes.code === '0' && regRes.data?.length > 0) {
+        tlog(`🧹 [GLOBAL] Found ${regRes.data.length} regular orders. Canceling...`);
+        const orders = regRes.data.map((o: any) => ({ instId: o.instId, ordId: o.ordId }));
+        await okxRequest('POST', '/api/v5/trade/cancel-batch-orders', orders);
+    }
+
+    // 2. Algo / Trigger / TPSL Orders
+    const types = ['trigger', 'tpsl', 'stop', 'trailing_stop', 'move_order_stop', 'iceberg', 'twap', 'conditional', 'oco', 'price_order'];
+    for (const type of types) {
+        // Broad query: all states, high limit
+        const res = await okxRequest('GET', `/api/v5/trade/orders-algo-pending?ordType=${type}&limit=100`);
+        if (res && res.code === '0' && res.data?.length > 0) {
+            tlog(`🧹 [GLOBAL] Found ${res.data.length} ${type} orders. IDs: ${res.data.map((a: any) => a.algoId).join(', ')}`);
+            for (const a of res.data) {
+                await okxRequest('POST', '/api/v5/trade/cancel-algos', [{
+                    instId: a.instId,
+                    algoId: a.algoId,
+                    ordType: a.algoOrdType
+                }]);
+            }
+        }
+    }
+
+    // 3. Grid Bots (Account-wide)
+    const gridRes = await okxRequest('GET', '/api/v5/tradingBot/grid/orders-algo-pending');
+    if (gridRes && gridRes.code === '0' && gridRes.data?.length > 0) {
+        tlog(`🤖 [GLOBAL] Found ${gridRes.data.length} active Grid Bots. Stopping all...`);
+        for (const bot of gridRes.data) {
+            tlog(`🛑 Stopping Grid Bot ${bot.algoId} for ${bot.instId}...`);
+            await okxRequest('POST', '/api/v5/tradingBot/grid/stop-order-algo', {
+                algoId: bot.algoId, instId: bot.instId, algoOrdType: bot.algoOrdType, stopType: '1' // '1' means sell all assets
+            });
+        }
+    }
+
+    tlog('✅ [GLOBAL] Deep cleanup finished.');
+    await new Promise(r => setTimeout(r, 1000));
+}
+
 async function cancelAllAlgoOrders(instId: string) {
-    tlog(`🧹 [${instId}] Checking for all pending Algo orders...`);
-    // Full list of OKX algo types
-    const types = ['trigger', 'tpsl', 'stop', 'trailing_stop', 'move_order_stop', 'iceberg', 'twap'];
+    tlog(`🧹 [${instId}] Checking for all pending orders (Normal & Algo)...`);
+    const regRes = await okxRequest('GET', `/api/v5/trade/orders-pending?instId=${instId}`);
+    if (regRes && regRes.code === '0' && regRes.data?.length > 0) {
+        const orders = regRes.data.map((o: any) => ({ instId: o.instId, ordId: o.ordId }));
+        await okxRequest('POST', '/api/v5/trade/cancel-batch-orders', orders);
+    }
+    const types = ['trigger', 'tpsl', 'stop', 'trailing_stop', 'move_order_stop', 'iceberg', 'twap', 'conditional'];
     for (const type of types) {
         const res = await okxRequest('GET', `/api/v5/trade/orders-algo-pending?instId=${instId}&algoOrdType=${type}`);
         if (res && res.code === '0' && res.data?.length > 0) {
-            tlog(`🧹 [${instId}] Found ${res.data.length} ${type} orders. Canceling...`);
             const algos = res.data.map((a: any) => ({ instId: a.instId, algoId: a.algoId }));
             await okxRequest('POST', '/api/v5/trade/cancel-algos', algos);
         }
     }
-
-    // Check for Grid Bots (Contract Grid specifically as it's common for SWAP)
     const gridTypes = ['grid', 'contract_grid'];
     for (const gType of gridTypes) {
         const grid = await okxRequest('GET', `/api/v5/grid/orders-algo-pending?instId=${instId}&algoOrdType=${gType}`);
         if (grid && grid.code === '0' && grid.data?.length > 0) {
-            terror(`⚠️ [${instId}] ACTIVE ${gType.toUpperCase()} DETECTED! This will block leverage changes.`);
-            terror(`👉 ACTION: Please stop all Grid Bots for ${instId} in the OKX App/Web.`);
+            terror(`⚠️ [${instId}] ACTIVE ${gType.toUpperCase()} DETECTED!`);
         }
     }
-
-    // Small pause to allow OKX state to update
-    await new Promise(r => setTimeout(r, 1000));
 }
+
+
 
 async function checkAlgoStatus(instId: string, algoId: string): Promise<string | null> {
     // Check pending
     let res = await okxRequest('GET', `/api/v5/trade/orders-algo-pending?instId=${instId}&algoId=${algoId}&algoOrdType=trigger`);
     if (res && res.code === '0' && res.data?.length > 0) return 'live';
-    
+
     // Check history
     res = await okxRequest('GET', `/api/v5/trade/orders-algo-history?instId=${instId}&algoId=${algoId}&algoOrdType=trigger`);
     if (res && res.code === '0' && res.data?.length > 0) return res.data[0].state; // 'effective', 'canceled', etc.
@@ -507,7 +581,7 @@ async function verifyBundleConsistencyExtended(sym: string, state: ZRState): Pro
     const cacheEntry = positionCache[sym];
     const stalenessLimit = 30000; // 30s
     const now = Date.now();
-    
+
     const longStale = !cacheEntry || (now - cacheEntry.long.lastUpdate > stalenessLimit);
     const shortStale = !cacheEntry || (now - cacheEntry.short.lastUpdate > stalenessLimit);
 
@@ -546,33 +620,53 @@ async function verifyBundleConsistencyExtended(sym: string, state: ZRState): Pro
 // ==========================================
 
 async function runHedgedManager() {
-    tlog(`\n🛡️ HEDGED ZONE RECOVERY MANAGER (${IS_SIMULATED ? 'DEMO' : 'LIVE'})`);
-    tlog(`📈 SYMBOLS: ${SYMBOLS.join(', ')}`);
-    if (SYMBOLS.length === 0) {
-        tlog("❌ CRITICAL: No symbols found in ZR_SYMBOLS. Please check your .env file.");
+    tlog(`\n🛡️ HEDGED ZONE RECOVERY MANAGER (v2.7)`);
+    tlog(`🛠️ Mode: ${IS_SIMULATED ? 'DEMO' : 'LIVE'}`);
+
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const choice = await new Promise<string>(resolve => {
+        rl.question('\n👉 [1] Continue from state\n👉 [2] FULL RESET (Close all positions/orders & Wipe files)\nSelection: ', resolve);
+    });
+    rl.close();
+
+    await setAccountMode();
+    loadConfig();
+
+    if (choice === '2') {
+        tlog('🧨 PERFORMING FULL SYSTEM RESET...');
+
+        // Account-wide order cleanup
+        await performGlobalCleanup();
+
+        for (const pair of zrConfig.pairs) {
+            await closeAllPositions(pair.instId);
+        }
+        if (fs.existsSync(STATE_FILE)) fs.unlinkSync(STATE_FILE);
+        if (fs.existsSync(PERF_LOG)) fs.unlinkSync(PERF_LOG);
+        if (fs.existsSync('eth_fills.json')) fs.unlinkSync('eth_fills.json');
+        tlog('✅ Reset complete. Starting fresh.');
+    }
+
+    loadState();
+    const ACTIVE_SYMBOLS = zrConfig.pairs.map(p => p.instId);
+    if (ACTIVE_SYMBOLS.length === 0) {
+        tlog("❌ CRITICAL: No symbols found in zr-config.json (and none in .env).");
         return;
     }
 
-    await setAccountMode();
-    loadState();
-    
+    tlog(`📈 ACTIVE SYMBOLS: ${ACTIVE_SYMBOLS.join(', ')}`);
+
     // START REAL-TIME POSITION CACHE
-    initializePositionCache(SYMBOLS);
+    initializePositionCache(ACTIVE_SYMBOLS);
 
     // START REAL-TIME PRICE FEED
-    initWebsocket(SYMBOLS);
-
-    tlog("⚙️ Syncing leverage and cleaning orders for all symbols...");
-    for (const sym of SYMBOLS) {
-        await cancelAllAlgoOrders(sym);
-        await setLeverage(sym, LEVERAGE);
-    }
+    initWebsocket(ACTIVE_SYMBOLS);
 
     while (true) {
         // Parallel processing of symbols for better reactivity
-        await Promise.all(SYMBOLS.map(async (sym) => {
-            try { await processSymbolHedged(sym); }
-            catch (e) { terror(`Error on ${sym}:`, e); }
+        await Promise.all(zrConfig.pairs.map(async (pair) => {
+            try { await processSymbolHedged(pair.instId); }
+            catch (e) { terror(`Error on ${pair.instId}:`, e); }
         }));
         await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
     }
@@ -595,24 +689,28 @@ async function processSymbolHedged(sym: string) {
         }
         const ctVal = parseFloat(res.data[0].ctVal);
         const tickSz = res.data[0].tickSz;
-        
+
         // Cooldown check to prevent rapid death loops
         if (cooldowns[sym] && Date.now() < cooldowns[sym]) {
             return;
         }
 
-        // 0. Clean the slate first (Cancel all triggers/SLs to allow leverage change)
+        const pairCfg = zrConfig.pairs.find(p => p.instId === sym) || { instId: sym, leverage: LEVERAGE, margin: MARGIN };
+        const useLever = pairCfg.leverage;
+        const useMargin = pairCfg.margin;
+
+        // 0. Clean the slate first
         await cancelAllAlgoOrders(sym);
 
         // 1. Set Leverage and capture ACTUAL leverage used
-        const actualLever = await setLeverage(sym, LEVERAGE);
+        const actualLever = await setLeverage(sym, useLever);
 
         const tickDecimals = tickSz.includes('.') ? tickSz.split('.')[1].length : 0;
-        tlog(`ℹ️ [${sym}] ctVal: ${ctVal}, Price: ${P}, Decimals: ${tickDecimals}, Leverage: ${actualLever}x`);
+        tlog(`ℹ️ [${sym}] ctVal: ${ctVal}, Price: ${P}, Decimals: ${tickDecimals}, Leverage: ${actualLever}x, Margin: $${useMargin}`);
 
         const side = Math.random() > 0.5 ? 'long' : 'short';
-        const sz1 = Math.max(1, Math.floor((MARGIN * actualLever) / (P * ctVal)));
-        
+        const sz1 = Math.max(1, Math.floor((useMargin * actualLever) / (P * ctVal)));
+
         const SL_low = side === 'long' ? round(P * (1 - SL_PCT), tickDecimals) : round(P * (1 - TP_PCT), tickDecimals);
         const TP_high = side === 'long' ? round(P * (1 + TP_PCT), tickDecimals) : round(P * (1 + SL_PCT), tickDecimals);
 
@@ -624,18 +722,18 @@ async function processSymbolHedged(sym: string) {
         const success = await executeOrder(sym, side === 'long' ? 'buy' : 'sell', side, sz1, tpPx, slPx);
         if (success) {
             const nextSide = side === 'long' ? 'short' : 'long';
-            const reversePx = side === 'long' 
-                ? round(P - (P * SL_PCT * REV_RATIO), tickDecimals) 
+            const reversePx = side === 'long'
+                ? round(P - (P * SL_PCT * REV_RATIO), tickDecimals)
                 : round(P + (P * SL_PCT * REV_RATIO), tickDecimals);
-            
+
             const nextTargetPx = nextSide === 'long' ? TP_high : SL_low;
-            
+
             // PnL of Leg 1 at Leg 2's target
             const pnl1AtTarget = (side === 'long' ? (nextTargetPx - P) : (P - nextTargetPx)) * sz1 * ctVal;
             const prevLegsFees = (sz1 * ctVal * P * FEE_PCT) * 2;
             const targetUSDT = (Math.abs(tpPx - P) * sz1 * ctVal) + CLOSE_USDT_PROFIT + prevLegsFees;
             const netNeeded = targetUSDT - pnl1AtTarget;
-            
+
             const effectiveDist = (Math.abs(nextTargetPx - reversePx) * (1 - SLIPPAGE_PCT)) * ctVal;
             const feeCostPerContract = (reversePx * FEE_PCT) * 2 * ctVal;
             const sz2 = Math.ceil((netNeeded / (effectiveDist - feeCostPerContract)) * MATH_BUFFER);
@@ -648,7 +746,9 @@ async function processSymbolHedged(sym: string) {
                 legs: [{ side, entryPx: P, sz: sz1 }],
                 currentReversePx: reversePx,
                 revAlgoId: revAlgoId || 'manual',
-                tickDecimals
+                tickDecimals,
+                leverage: useLever,
+                margin: useMargin
             };
             saveState();
             logEvent({ sym, action: 'start', details: { side, entryPx: P, sz: sz1, tpPx, slPx, revAlgoId } });
@@ -656,7 +756,7 @@ async function processSymbolHedged(sym: string) {
     } else {
         // 1. FETCH LIVE STATE FIRST
         const { consistent, liveUpl, liveLong, liveShort } = await verifyBundleConsistencyExtended(sym, state);
-        
+
         // 2. SELF-HEALING REVERSAL CHECK
         const lastLeg = state.legs[state.legs.length - 1];
         const currentSide = lastLeg.side;
@@ -677,7 +777,7 @@ async function processSymbolHedged(sym: string) {
                 return;
             }
             tlog(`\n🔄 [${sym}] REVERSAL DETECTED! (Status: ${revStatus || 'external/positions'})...`);
-            
+
             // MATH FOR BOUND STRATEGY:
             // Sz_new = (Target_USDT - Current_PnL_at_Target) / Distance_to_Target
             const tickDecimals = state.tickDecimals;
@@ -689,12 +789,12 @@ async function processSymbolHedged(sym: string) {
                 if (leg.side === 'long') pnlAtTarget += (nextTargetPx - leg.entryPx) * leg.sz * state.ctVal;
                 else pnlAtTarget += (leg.entryPx - nextTargetPx) * leg.sz * state.ctVal;
             }
-            
+
             const totalSzCurrently = state.legs.reduce((acc, l) => acc + l.sz, 0);
             const estFeesPrev = (totalSzCurrently * state.ctVal * state.currentReversePx * FEE_PCT) * 2;
             const targetUSDT = state.E_profit + CLOSE_USDT_PROFIT + estFeesPrev;
             const netNeeded = targetUSDT - pnlAtTarget;
-            
+
             const effectiveDist = (Math.abs(nextTargetPx - state.currentReversePx) * (1 - SLIPPAGE_PCT)) * state.ctVal;
             const feeCostPerContract = (state.currentReversePx * FEE_PCT) * 2 * state.ctVal;
             const sz = Math.ceil((netNeeded / (effectiveDist - feeCostPerContract)) * MATH_BUFFER);
@@ -703,26 +803,53 @@ async function processSymbolHedged(sym: string) {
 
             // Update state with the new leg
             state.legs.push({ side: nextSide, entryPx: state.currentReversePx, sz });
-            
-            // Re-attach hard TP/SL for the new position (in case external trigger didn't have them)
+
+            // 1. Mandatory Protection: Close the PREVIOUS position side entirely
+            const prevSide = currentSide;
+            tlog(`🧹 [${sym}] Closing previous side (${prevSide.toUpperCase()}) to ensure direction switch.`);
+            await okxRequest('POST', '/api/v5/trade/close-position', { instId: sym, mgnMode: 'isolated', posSide: prevSide });
+
+            // 2. Re-attach hard TP/SL for the NEW position side
+            // We use 'conditional' ordType. To close a leg, we must place an order in the opposite direction.
+            // If new leg is LONG, TP is Sell at TP_high, SL is Sell at SL_low.
+            const closingSide = nextSide === 'long' ? 'sell' : 'buy';
+            tlog(`🛡️ [${sym}] Attaching Hard TP/SL to ${nextSide.toUpperCase()} leg (Sz: ${sz})...`);
             await okxRequest('POST', '/api/v5/trade/order-algo', {
-                instId: sym, tdMode: 'isolated', posSide: nextSide, side: nextSide === 'long' ? 'buy' : 'sell',
+                instId: sym, tdMode: 'isolated', posSide: nextSide, side: closingSide,
                 ordType: 'conditional', sz: sz.toString(),
-                slTriggerPx: nextStopPx.toString(), slOrdPx: '-1',
-                tpTriggerPx: nextTargetPx.toString(), tpOrdPx: '-1'
+                tpTriggerPx: nextTargetPx.toString(), tpOrdPx: '-1',
+                slTriggerPx: nextStopPx.toString(), slOrdPx: '-1'
             });
 
-            // Prepare NEXT reversal (Always at the SAME price line)
-            const newReversePx = state.currentReversePx; 
+            // 3. Calculate and Prepare NEXT reversal (Leg N+2)
             const nextSideReversed = nextSide === 'long' ? 'short' : 'long';
+            const newReversePx = state.currentReversePx;
 
-            const nextAlgoId = await placeTriggerOrder(sym, nextSideReversed === 'long' ? 'buy' : 'sell', nextSideReversed, newReversePx, 1); // Sz will be recalculated on trigger
-            
+            // CALCULATE SIZE FOR NEXT LEG (so user sees it on exchange)
+            // Re-run the sizing logic but for the next leg count
+            let pnlAtNextTarget = 0;
+            const nextLegs = [...state.legs]; // Copy current legs (after we added the new one)
+            const nextTargetPxN2 = nextSideReversed === 'long' ? state.TP_high : state.SL_low;
+            for (const leg of nextLegs) {
+                if (leg.side === 'long') pnlAtNextTarget += (nextTargetPxN2 - leg.entryPx) * leg.sz * state.ctVal;
+                else pnlAtNextTarget += (leg.entryPx - nextTargetPxN2) * leg.sz * state.ctVal;
+            }
+            const totalSzNext = nextLegs.reduce((acc, l) => acc + l.sz, 0);
+            const estFeesNext = (totalSzNext * state.ctVal * newReversePx * FEE_PCT) * 2;
+            const targetUSDTNext = state.E_profit + CLOSE_USDT_PROFIT + estFeesNext;
+            const netNeededNext = targetUSDTNext - pnlAtNextTarget;
+            const effectiveDistNext = (Math.abs(nextTargetPxN2 - newReversePx) * (1 - SLIPPAGE_PCT)) * state.ctVal;
+            const feeCostPerContractNext = (newReversePx * FEE_PCT) * 2 * state.ctVal;
+            const szNext = Math.ceil((netNeededNext / (effectiveDistNext - feeCostPerContractNext)) * MATH_BUFFER);
+
+            tlog(`🚀 [${sym}] Preparing Log ${state.legs.length + 1} Reversal Trigger. Sz: ${szNext}`);
+            const nextAlgoId = await placeTriggerOrder(sym, nextSideReversed === 'long' ? 'buy' : 'sell', nextSideReversed, newReversePx, szNext);
+
             state.currentReversePx = newReversePx;
             state.revAlgoId = nextAlgoId || 'manual';
             state.lastRevTime = Date.now();
             saveState();
-            logEvent({ sym, action: 'reversal', details: { side: nextSide, sz, count: state.legs.length, nextAlgoId } });
+            logEvent({ sym, action: 'reversal', details: { side: nextSide, sz, count: state.legs.length, nextAlgoId, nextSz: szNext } });
             return;
         }
 
@@ -744,7 +871,7 @@ async function processSymbolHedged(sym: string) {
             const count = (activeState.mismatches[sym] || 0) + 1;
             activeState.mismatches[sym] = count;
             if (count < 12) {
-                tlog(`⚠️ [${sym}] Consistency Mismatch! OKX:L:${liveLong} S:${liveShort} | JSON:L:${(state.legs.filter(l=>l.side==='long').reduce((a,l)=>a+l.sz,0))} S:${(state.legs.filter(l=>l.side==='short').reduce((a,l)=>a+l.sz,0))} (${count}/12)`);
+                tlog(`⚠️ [${sym}] Consistency Mismatch! OKX:L:${liveLong} S:${liveShort} | JSON:L:${(state.legs.filter(l => l.side === 'long').reduce((a, l) => a + l.sz, 0))} S:${(state.legs.filter(l => l.side === 'short').reduce((a, l) => a + l.sz, 0))} (${count}/12)`);
                 return;
             } else {
                 tlog(`❌ [${sym}] Out of sync. FORCING CLOSE ALL. (Cooldown 60s)`);

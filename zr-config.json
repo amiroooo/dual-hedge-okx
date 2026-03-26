@@ -1,0 +1,54 @@
+{
+  "pairs": [
+    {
+      "instId": "BTC-USDT-SWAP",
+      "leverage": 10,
+      "margin": 10
+    },
+    {
+      "instId": "ETH-USDT-SWAP",
+      "leverage": 2,
+      "margin": 10
+    },
+    {
+      "instId": "SOL-USDT-SWAP",
+      "leverage": 5,
+      "margin": 5
+    },
+    {
+      "instId": "XRP-USDT-SWAP",
+      "leverage": 5,
+      "margin": 5
+    },
+    {
+      "instId": "LINK-USDT-SWAP",
+      "leverage": 5,
+      "margin": 5
+    },
+    {
+      "instId": "ADA-USDT-SWAP",
+      "leverage": 5,
+      "margin": 5
+    },
+    {
+      "instId": "DOGE-USDT-SWAP",
+      "leverage": 5,
+      "margin": 5
+    },
+    {
+      "instId": "LTC-USDT-SWAP",
+      "leverage": 5,
+      "margin": 5
+    },
+    {
+      "instId": "AVAX-USDT-SWAP",
+      "leverage": 5,
+      "margin": 5
+    },
+    {
+      "instId": "DOT-USDT-SWAP",
+      "leverage": 5,
+      "margin": 5
+    }
+  ]
+}
