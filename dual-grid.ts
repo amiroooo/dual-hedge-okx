@@ -31,7 +31,7 @@ const API_KEY = IS_SIMULATED ? process.env.OKX_API_KEY_TEST as string : process.
 const API_SECRET = IS_SIMULATED ? process.env.OKX_API_SECRET_TEST as string : process.env.OKX_API_SECRET_LIVE as string;
 const API_PASSPHRASE = process.env.OKX_API_PASSPHRASE as string;
 const bufferDistanceToClose = Number(process.env.OKX_BUFFER_DISTANCE_TO_CLOSE) || 0.02;
-const gridPercentRange = Number(process.env.OKX_GRID_PERCENTAGE_RANGE) || 0.10;
+const gridPercentRange = Number(process.env.OKX_GRID_PERCENTAGE_RANGE) || 0.2;
 const liqPercentageDistance = 0.1;
 
 const BASE_URL = 'https://www.okx.com';

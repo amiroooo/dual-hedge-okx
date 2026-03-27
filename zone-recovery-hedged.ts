@@ -855,8 +855,8 @@ async function processSymbolHedged(sym: string) {
             }
             // Remove the closed long legs from state
             state.legs = state.legs.filter(l => l.side !== 'long');
-            // Cancel any remaining algo orders for the closed side
-            await cancelAlgoOrder(sym, state.revAlgoId);
+            // Cancel ALL algo orders for the closed side (including TP/SL)
+            await cancelAllAlgoOrders(sym);
             // Now close the remaining short side as well (cycle is over — TP/SL means we won or lost)
             tlog(`🏁 [${sym}] Closing remaining short positions to end cycle.`);
             await closeAllPositions(sym);
@@ -877,7 +877,7 @@ async function processSymbolHedged(sym: string) {
                 }
             }
             state.legs = state.legs.filter(l => l.side !== 'short');
-            await cancelAlgoOrder(sym, state.revAlgoId);
+            await cancelAllAlgoOrders(sym);
             tlog(`🏁 [${sym}] Closing remaining long positions to end cycle.`);
             await closeAllPositions(sym);
             delete activeState.symbols[sym];
