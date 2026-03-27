@@ -904,7 +904,7 @@ async function processSymbolHedged(sym: string) {
             activeState.mismatches[sym] = count;
             if (count < 12) {
                 tlog(`⚠️ [${sym}] Consistency Mismatch! OKX:L:${liveLong} S:${liveShort} | JSON:L:${(state.legs.filter(l => l.side === 'long').reduce((a, l) => a + l.sz, 0))} S:${(state.legs.filter(l => l.side === 'short').reduce((a, l) => a + l.sz, 0))} (${count}/12)`);
-                fs.appendFileSync('mismatch_debug.log', `[${sym}] Mismatch Info -> OKX liveLong/Short: ${liveLong}/${liveShort} | JSON: ${state.legs.filter(l => l.side === 'long').reduce((a, l) => a + l.sz, 0)}/${state.legs.filter(l => l.side === 'short').reduce((a, l) => a + l.sz, 0)}\n`);
+                fs.appendFileSync('mismatch_debug.log', `[${new Date().toISOString()}] [${sym}] Mismatch Info -> OKX liveLong/Short: ${liveLong}/${liveShort} | JSON: ${state.legs.filter(l => l.side === 'long').reduce((a, l) => a + l.sz, 0)}/${state.legs.filter(l => l.side === 'short').reduce((a, l) => a + l.sz, 0)}\n`);
                 return;
             } else {
                 tlog(`❌ [${sym}] Out of sync. FORCING CLOSE ALL. (Cooldown 60s)`);
