@@ -432,8 +432,24 @@ async function executeOrder(instId: string, side: 'buy' | 'sell', posSide: 'long
 
 async function closeAllPositions(instId: string) {
     tlog(`♻️ [${instId}] Closing entire bundle...`);
-    await okxRequest('POST', '/api/v5/trade/close-position', { instId, mgnMode: 'isolated', posSide: 'long' });
-    await okxRequest('POST', '/api/v5/trade/close-position', { instId, mgnMode: 'isolated', posSide: 'short' });
+    for (let attempt = 0; attempt < 3; attempt++) {
+        await okxRequest('POST', '/api/v5/trade/close-position', { instId, mgnMode: 'isolated', posSide: 'long' });
+        await okxRequest('POST', '/api/v5/trade/close-position', { instId, mgnMode: 'isolated', posSide: 'short' });
+        await new Promise(r => setTimeout(r, 1500));
+        // Verify positions are actually closed
+        const verify = await okxRequest('GET', `/api/v5/account/positions?instId=${instId}`);
+        if (verify?.code === '0') {
+            const stillOpen = verify.data?.filter((p: any) => Math.abs(parseInt(p.pos)) > 0) || [];
+            if (stillOpen.length === 0) {
+                tlog(`✅ [${instId}] All positions confirmed closed.`);
+                return;
+            }
+            tlog(`⚠️ [${instId}] ${stillOpen.length} position(s) still open after close attempt ${attempt + 1}. Retrying...`);
+        }
+        await new Promise(r => setTimeout(r, 2000));
+    }
+    terror(`❌ [${instId}] Failed to close all positions after 3 attempts!`);
+    process.exit(1);
 }
 
 async function setLeverage(instId: string, lever: number): Promise<number> {
@@ -513,8 +529,7 @@ async function performGlobalCleanup() {
             for (const a of res.data) {
                 await okxRequest('POST', '/api/v5/trade/cancel-algos', [{
                     instId: a.instId,
-                    algoId: a.algoId,
-                    ordType: a.algoOrdType
+                    ordId: a.algoId,
                 }]);
             }
         }
@@ -545,7 +560,7 @@ async function cancelAllAlgoOrders(instId: string) {
     }
     const types = ['trigger', 'tpsl', 'stop', 'trailing_stop', 'move_order_stop', 'iceberg', 'twap', 'conditional'];
     for (const type of types) {
-        const res = await okxRequest('GET', `/api/v5/trade/orders-algo-pending?instId=${instId}&algoOrdType=${type}`);
+        const res = await okxRequest('GET', `/api/v5/trade/orders-algo-pending?instId=${instId}&ordType=${type}`);
         if (res && res.code === '0' && res.data?.length > 0) {
             const algos = res.data.map((a: any) => ({ instId: a.instId, algoId: a.algoId }));
             await okxRequest('POST', '/api/v5/trade/cancel-algos', algos);
@@ -553,7 +568,7 @@ async function cancelAllAlgoOrders(instId: string) {
     }
     const gridTypes = ['grid', 'contract_grid'];
     for (const gType of gridTypes) {
-        const grid = await okxRequest('GET', `/api/v5/grid/orders-algo-pending?instId=${instId}&algoOrdType=${gType}`);
+        const grid = await okxRequest('GET', `/api/v5/grid/orders-algo-pending?instId=${instId}&ordType=${gType}`);
         if (grid && grid.code === '0' && grid.data?.length > 0) {
             terror(`⚠️ [${instId}] ACTIVE ${gType.toUpperCase()} DETECTED!`);
         }
@@ -668,6 +683,10 @@ async function runHedgedManager() {
         // Account-wide order cleanup
         await performGlobalCleanup();
 
+        // Wait for rate limits to recover before closing positions
+        tlog('⏳ Waiting 3s for API rate limits to recover before closing positions...');
+        await new Promise(r => setTimeout(r, 3000));
+
         for (const pair of zrConfig.pairs) {
             await closeAllPositions(pair.instId);
         }
@@ -705,13 +724,26 @@ async function runHedgedManager() {
 
 async function processSymbolHedged(sym: string) {
     const state = activeState.symbols[sym];
-    const P = await getTickerPrice(sym);
+    let P = await getTickerPrice(sym);
     if (!P) {
         tlog(`⚠️ [${sym}] Price fetch failed. skipping...`);
         return;
     }
 
     if (!state) {
+        // GUARD: Close any pre-existing positions before starting a new cycle
+        const existingPos = await okxRequest('GET', `/api/v5/account/positions?instId=${sym}`);
+        if (existingPos?.code === '0' && existingPos.data?.length > 0) {
+            const openPositions = existingPos.data.filter((p: any) => Math.abs(parseInt(p.pos)) > 0);
+            if (openPositions.length > 0) {
+                tlog(`⚠️ [${sym}] Found ${openPositions.length} pre-existing position(s) on OKX! Cleaning up before initializing...`);
+                await cancelAllAlgoOrders(sym);
+                await closeAllPositions(sym);
+                tlog(`✅ [${sym}] Pre-existing positions cleaned. Will initialize on next cycle.`);
+                return; // Return and let the next tick initialize cleanly
+            }
+        }
+
         tlog(`ℹ️ [${sym}] No state found. Initializing cycle...`);
         const res = await okxRequest('GET', `/api/v5/public/instruments?instType=SWAP&instId=${sym}`);
         if (!res || res.code !== '0' || !res.data?.[0]) {
@@ -739,14 +771,27 @@ async function processSymbolHedged(sym: string) {
         const tickDecimals = tickSz.includes('.') ? tickSz.split('.')[1].length : 0;
         tlog(`ℹ️ [${sym}] ctVal: ${ctVal}, Price: ${P}, Decimals: ${tickDecimals}, Leverage: ${actualLever}x, Margin: $${useMargin}`);
 
+        // PRICE SANITY CHECK: Cross-validate WebSocket price with REST to prevent stale entries
+        const restTicker = await okxRequest('GET', `/api/v5/market/ticker?instId=${sym}`);
+        if (restTicker?.code === '0' && restTicker.data?.[0]?.last) {
+            const restPrice = parseFloat(restTicker.data[0].last);
+            const drift = Math.abs(P - restPrice) / restPrice;
+            if (drift > 0.01) {
+                tlog(`⚠️ [${sym}] Price drift detected! WS: ${P}, REST: ${restPrice} (${(drift * 100).toFixed(2)}%). Using REST price.`);
+                P = restPrice;
+            }
+        }
+
         const side = Math.random() > 0.5 ? 'long' : 'short';
         const sz1 = Math.max(1, Math.floor((useMargin * actualLever) / (P * ctVal)));
 
-        const SL_low = side === 'long' ? round(P * (1 - SL_PCT), tickDecimals) : round(P * (1 - TP_PCT), tickDecimals);
-        const TP_high = side === 'long' ? round(P * (1 + TP_PCT), tickDecimals) : round(P * (1 + SL_PCT), tickDecimals);
+        // Symmetric bounds: SL_low is ALWAYS the lower exit, TP_high is ALWAYS the upper exit.
+        // Both sides share the same boundaries so all legs close together.
+        const SL_low = round(P * (1 - SL_PCT), tickDecimals);
+        const TP_high = round(P * (1 + TP_PCT), tickDecimals);
 
-        // Standardize boundaries: SL_low is always the "bottom" exit, TP_high is always the "top" exit.
-        // For Longs: TP=TP_high, SL=SL_low. For Shorts: TP=SL_low, SL=TP_high.
+        // For Longs: TP at TP_high (price goes up), SL at SL_low (price goes down)
+        // For Shorts: TP at SL_low (price goes down), SL at TP_high (price goes up)
         const tpPx = side === 'long' ? TP_high : SL_low;
         const slPx = side === 'long' ? SL_low : TP_high;
 
@@ -788,7 +833,61 @@ async function processSymbolHedged(sym: string) {
         // 1. FETCH LIVE STATE FIRST
         const { consistent, liveUpl, liveLong, liveShort } = await verifyBundleConsistencyExtended(sym, state);
 
-        // 2. SELF-HEALING REVERSAL CHECK
+        // 2. CHECK IF TP/SL EXTERNALLY CLOSED A SIDE (valid state transition, NOT a mismatch)
+        const expectedLong = state.legs.filter(l => l.side === 'long').reduce((a, l) => a + l.sz, 0);
+        const expectedShort = state.legs.filter(l => l.side === 'short').reduce((a, l) => a + l.sz, 0);
+
+        // Detect if one side was completely closed by TP/SL while the other side matches or grew
+        const longClosed = expectedLong > 0 && liveLong === 0;
+        const shortClosed = expectedShort > 0 && liveShort === 0;
+
+        // If one  side is completely gone and the other side still exists, TP/SL has exited that side
+        if (longClosed && liveShort > 0) {
+            tlog(`🏁 [${sym}] Long side TP/SL triggered (expected ${expectedLong}, got 0). Short side still active (${liveShort}).`);
+            // Check if the reversal algo also filled (adding to the surviving short side)
+            const algoStatus = await checkAlgoStatus(sym, state.revAlgoId);
+            if (algoStatus === 'effective' || liveShort > expectedShort) {
+                const newSz = liveShort - expectedShort;
+                if (newSz > 0) {
+                    tlog(`🔄 [${sym}] Reversal also filled! Adding short leg sz=${newSz} to state.`);
+                    state.legs.push({ side: 'short', entryPx: state.currentReversePx, sz: newSz });
+                }
+            }
+            // Remove the closed long legs from state
+            state.legs = state.legs.filter(l => l.side !== 'long');
+            // Cancel any remaining algo orders for the closed side
+            await cancelAlgoOrder(sym, state.revAlgoId);
+            // Now close the remaining short side as well (cycle is over — TP/SL means we won or lost)
+            tlog(`🏁 [${sym}] Closing remaining short positions to end cycle.`);
+            await closeAllPositions(sym);
+            delete activeState.symbols[sym];
+            delete activeState.mismatches[sym];
+            saveState();
+            logEvent({ sym, action: 'exit_tpsl', details: { closedSide: 'long', remainingShort: liveShort } });
+            return;
+        }
+        if (shortClosed && liveLong > 0) {
+            tlog(`🏁 [${sym}] Short side TP/SL triggered (expected ${expectedShort}, got 0). Long side still active (${liveLong}).`);
+            const algoStatus = await checkAlgoStatus(sym, state.revAlgoId);
+            if (algoStatus === 'effective' || liveLong > expectedLong) {
+                const newSz = liveLong - expectedLong;
+                if (newSz > 0) {
+                    tlog(`🔄 [${sym}] Reversal also filled! Adding long leg sz=${newSz} to state.`);
+                    state.legs.push({ side: 'long', entryPx: state.currentReversePx, sz: newSz });
+                }
+            }
+            state.legs = state.legs.filter(l => l.side !== 'short');
+            await cancelAlgoOrder(sym, state.revAlgoId);
+            tlog(`🏁 [${sym}] Closing remaining long positions to end cycle.`);
+            await closeAllPositions(sym);
+            delete activeState.symbols[sym];
+            delete activeState.mismatches[sym];
+            saveState();
+            logEvent({ sym, action: 'exit_tpsl', details: { closedSide: 'short', remainingLong: liveLong } });
+            return;
+        }
+
+        // 3. SELF-HEALING REVERSAL CHECK (only if both sides still exist or we're waiting for a fill)
         const lastLeg = state.legs[state.legs.length - 1];
         const currentSide = lastLeg.side;
         const nextSide = currentSide === 'long' ? 'short' : 'long';
@@ -815,10 +914,21 @@ async function processSymbolHedged(sym: string) {
         const feeCostPerContract = (state.currentReversePx * FEE_PCT) * 2 * state.ctVal;
         const sz = Math.ceil((netNeeded / (effectiveDist - feeCostPerContract)) * MATH_BUFFER);
 
-        // Await full execution of limit order before proceeding to prevent partial fill vulnerability
+        // Check if the reversal algo order has filled
         const currentSumNextSide = state.legs.filter(l => l.side === nextSide).reduce((acc, l) => acc + l.sz, 0);
         const nextSideLive = nextSide === 'long' ? liveLong : liveShort;
-        const fullyReversed = nextSideLive >= (currentSumNextSide + sz);
+
+        // Also check algo status directly for more reliable fill detection
+        let algoFilled = false;
+        if (state.revAlgoId && state.revAlgoId !== 'manual') {
+            const algoStatus = await checkAlgoStatus(sym, state.revAlgoId);
+            if (algoStatus === 'effective') {
+                algoFilled = true;
+                tlog(`📋 [${sym}] Algo order ${state.revAlgoId} confirmed as FILLED via API.`);
+            }
+        }
+
+        const fullyReversed = algoFilled || nextSideLive >= (currentSumNextSide + sz);
 
         if (fullyReversed) {
             if (state.legs.length >= MAX_REVERSALS) {
@@ -826,19 +936,20 @@ async function processSymbolHedged(sym: string) {
                 return;
             }
             tlog(`\n🔄 [${sym}] REVERSAL FULLY OPENED! (Exchange Synced)...`);
-            tlog(`🧪 [${sym}] Leg ${state.legs.length + 1} Sizing: NetNeeded:$${netNeeded.toFixed(2)}, Sz:${sz}`);
+
+            // Determine actual fill size from exchange
+            const actualSz = algoFilled ? Math.max(nextSideLive - currentSumNextSide, sz) : sz;
+            tlog(`🧪 [${sym}] Leg ${state.legs.length + 1} Sizing: NetNeeded:$${netNeeded.toFixed(2)}, Sz:${actualSz}`);
 
             // Update state with the new leg
-            state.legs.push({ side: nextSide, entryPx: state.currentReversePx, sz });
+            state.legs.push({ side: nextSide, entryPx: state.currentReversePx, sz: actualSz });
 
             // 1. Re-attach hard TP/SL for the NEW position side
-            // We use 'conditional' ordType. To close a leg, we must place an order in the opposite direction.
-            // If new leg is LONG, TP is Sell at TP_high, SL is Sell at SL_low.
             const closingSide = nextSide === 'long' ? 'sell' : 'buy';
-            tlog(`🛡️ [${sym}] Attaching Hard TP/SL to ${nextSide.toUpperCase()} leg (Sz: ${sz})...`);
+            tlog(`🛡️ [${sym}] Attaching Hard TP/SL to ${nextSide.toUpperCase()} leg (Sz: ${actualSz})...`);
             await okxRequest('POST', '/api/v5/trade/order-algo', {
                 instId: sym, tdMode: 'isolated', posSide: nextSide, side: closingSide,
-                ordType: 'conditional', sz: sz.toString(),
+                ordType: 'conditional', sz: actualSz.toString(),
                 tpTriggerPx: nextTargetPx.toString(), tpOrdPx: '-1',
                 slTriggerPx: nextStopPx.toString(), slOrdPx: '-1'
             });
@@ -860,9 +971,8 @@ async function processSymbolHedged(sym: string) {
             }
 
             // CALCULATE SIZE FOR NEXT LEG (so user sees it on exchange)
-            // Re-run the sizing logic but for the next leg count
             let pnlAtNextTarget = 0;
-            const nextLegs = [...state.legs]; // Copy current legs (after we added the new one)
+            const nextLegs = [...state.legs];
             const nextTargetPxN2 = nextSideReversed === 'long' ? state.TP_high : state.SL_low;
             for (const leg of nextLegs) {
                 if (leg.side === 'long') pnlAtNextTarget += (nextTargetPxN2 - leg.entryPx) * leg.sz * state.ctVal;
@@ -870,7 +980,7 @@ async function processSymbolHedged(sym: string) {
             }
             const totalSzNext = nextLegs.reduce((acc, l) => acc + l.sz, 0);
             const estFeesNext = (totalSzNext * state.ctVal * newReversePx * FEE_PCT) * 2;
-            const targetUSDTNext = CLOSE_USDT_PROFIT + estFeesNext; // Break-even + safety
+            const targetUSDTNext = CLOSE_USDT_PROFIT + estFeesNext;
             const netNeededNext = targetUSDTNext - pnlAtNextTarget;
             const effectiveDistNext = (Math.abs(nextTargetPxN2 - newReversePx) * (1 - SLIPPAGE_PCT)) * state.ctVal;
             const feeCostPerContractNext = (newReversePx * FEE_PCT) * 2 * state.ctVal;
@@ -883,7 +993,7 @@ async function processSymbolHedged(sym: string) {
             state.revAlgoId = nextAlgoId || 'manual';
             state.lastRevTime = Date.now();
             saveState();
-            logEvent({ sym, action: 'reversal', details: { side: nextSide, sz, count: state.legs.length, nextAlgoId, nextSz: szNext } });
+            logEvent({ sym, action: 'reversal', details: { side: nextSide, sz: actualSz, count: state.legs.length, nextAlgoId, nextSz: szNext } });
             return;
         }
 

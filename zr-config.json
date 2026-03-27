@@ -16,11 +16,6 @@
       "margin": 5
     },
     {
-      "instId": "XRP-USDT-SWAP",
-      "leverage": 5,
-      "margin": 5
-    },
-    {
       "instId": "LINK-USDT-SWAP",
       "leverage": 5,
       "margin": 5
