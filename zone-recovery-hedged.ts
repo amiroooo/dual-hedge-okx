@@ -22,7 +22,7 @@ const MARGIN = Number(process.env.ZR_MARGIN) || 10;
 const LEVERAGE = Number(process.env.ZR_LEVERAGE) || 5;
 const TP_PCT = Number(process.env.ZR_TP_PCT) || 0.01;
 const SL_PCT = Number(process.env.ZR_SL_PCT) || 0.02; // New SL Distance
-const REV_RATIO = 0.5; // Reversal at 50% (Midpoint)
+const REV_RATIO = 0.6; // Reversal at 60% (Less frequent, balanced size)
 const MAX_REVERSALS = Number(process.env.ZR_MAX_REVERSALS) || 5;
 const POLL_INTERVAL_MS = Number(process.env.ZR_POLL_INTERVAL_MS) || 5000;
 const CLOSE_USDT_PROFIT = Number(process.env.ZR_CLOSE_USDT_PROFIT) || 1.0;
@@ -33,6 +33,7 @@ const MATH_BUFFER = Number(process.env.ZR_MATH_BUFFER) || 1.05; // 5% extra size
 const BASE_URL = 'https://www.okx.com';
 const STATE_FILE = '.zr-hedged-state.json';
 const PERF_LOG = 'zr-hedged-performance.json';
+const API_LOG = 'zr-api-debug.log';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const CONFIG_FILE = 'zr-config.json';
@@ -203,8 +204,10 @@ async function okxRequest(method: string, endpoint: string, bodyObj: any = null)
             data: bodyStr ? bodyStr : undefined,
             timeout: 10000
         });
+        fs.appendFileSync(API_LOG, `[REST] ${new Date().toISOString()} | ${method} ${endpoint} | Req: ${bodyStr} | Res: ${JSON.stringify(response.data)}\n`);
         return response.data;
     } catch (error: any) {
+        fs.appendFileSync(API_LOG, `[REST ERR] ${new Date().toISOString()} | ${method} ${endpoint} | Req: ${bodyStr} | Err: ${error.message}\n`);
         if (error.code === 'ECONNABORTED') return { code: '-1', msg: 'Request timed out after 10s' };
         return { code: '-1', msg: error.response?.data?.msg || error.message };
     }
@@ -255,7 +258,11 @@ function initWebsocket(symbols: string[]) {
         });
         pubWs.on('message', (data) => {
             try {
-                const json = JSON.parse(data.toString());
+                const dataStr = data.toString();
+                if (dataStr !== 'pong') {
+                    fs.appendFileSync(API_LOG, `[WS PUB] ${new Date().toISOString()} | ${dataStr}\n`);
+                }
+                const json = JSON.parse(dataStr);
                 if (json.arg?.channel === 'tickers' && json.data?.[0]?.last) {
                     priceCache[json.arg.instId] = parseFloat(json.data[0].last);
                 }
@@ -313,6 +320,7 @@ function initWebsocket(symbols: string[]) {
                     }
                     return;
                 }
+                fs.appendFileSync(API_LOG, `[WS PRIV] ${new Date().toISOString()} | ${dataStr}\n`);
                 const json = JSON.parse(dataStr);
                 if (json.event === 'login' && json.code === '0') {
                     tlog('✅ Private WS Logged in. Subscribing to positions...');
@@ -469,9 +477,9 @@ async function setLeverage(instId: string, lever: number): Promise<number> {
 }
 
 async function placeTriggerOrder(instId: string, side: 'buy' | 'sell', posSide: 'long' | 'short', triggerPx: number, sz: number): Promise<string | null> {
-    tlog(`🚀 [${instId}] Placing Trigger Order: ${side.toUpperCase()} ${sz} at ${triggerPx} (posSide: ${posSide})`);
+    tlog(`🚀 [${instId}] Placing Trigger Order (Limit): ${side.toUpperCase()} ${sz} at ${triggerPx} (posSide: ${posSide})`);
     const res = await okxRequest('POST', '/api/v5/trade/order-algo', {
-        instId, tdMode: 'isolated', side, posSide, ordType: 'trigger', triggerPx: triggerPx.toString(), orderPx: '-1', sz: sz.toString()
+        instId, tdMode: 'isolated', side, posSide, ordType: 'trigger', triggerPx: triggerPx.toString(), orderPx: triggerPx.toString(), sz: sz.toString()
     });
     if (res && res.code === '0' && res.data?.[0]?.algoId) return res.data[0].algoId;
     terror(`❌ [${instId}] Trigger Order failed:`, res.msg || res.data?.[0]?.sMsg);
@@ -610,6 +618,27 @@ async function verifyBundleConsistencyExtended(sym: string, state: ZRState): Pro
     }
 
     if (liveLong !== expectedLong || liveShort !== expectedShort) {
+        // Double-check with REST API immediately to prevent WebSocket race condition bugs
+        const res = await okxRequest('GET', `/api/v5/account/positions?instId=${sym}`);
+        if (res && res.code === '0') {
+            liveUpl = 0; liveLong = 0; liveShort = 0;
+            for (const pos of res.data) {
+                if (pos.mgnMode !== 'isolated') continue;
+                const sideUpl = parseFloat(pos.upl || '0');
+                liveUpl += sideUpl;
+                if (pos.posSide === 'long') liveLong += Math.abs(parseInt(pos.pos));
+                if (pos.posSide === 'short') liveShort += Math.abs(parseInt(pos.pos));
+            }
+            if (positionCache[sym]) {
+                positionCache[sym].long.sz = liveLong;
+                positionCache[sym].short.sz = liveShort;
+                positionCache[sym].long.lastUpdate = Date.now();
+                positionCache[sym].short.lastUpdate = Date.now();
+            }
+        }
+    }
+
+    if (liveLong !== expectedLong || liveShort !== expectedShort) {
         return { consistent: false, liveUpl, liveLong, liveShort };
     }
     return { consistent: true, liveUpl, liveLong, liveShort };
@@ -643,7 +672,7 @@ async function runHedgedManager() {
         }
         if (fs.existsSync(STATE_FILE)) fs.unlinkSync(STATE_FILE);
         if (fs.existsSync(PERF_LOG)) fs.unlinkSync(PERF_LOG);
-        if (fs.existsSync('eth_fills.json')) fs.unlinkSync('eth_fills.json');
+        if (fs.existsSync(API_LOG)) fs.unlinkSync(API_LOG);
         tlog('✅ Reset complete. Starting fresh.');
     }
 
@@ -731,7 +760,7 @@ async function processSymbolHedged(sym: string) {
             // PnL of Leg 1 at Leg 2's target
             const pnl1AtTarget = (side === 'long' ? (nextTargetPx - P) : (P - nextTargetPx)) * sz1 * ctVal;
             const prevLegsFees = (sz1 * ctVal * P * FEE_PCT) * 2;
-            const targetUSDT = (Math.abs(tpPx - P) * sz1 * ctVal) + CLOSE_USDT_PROFIT + prevLegsFees;
+            const targetUSDT = CLOSE_USDT_PROFIT + prevLegsFees; // Break-even + safety on reversal
             const netNeeded = targetUSDT - pnl1AtTarget;
 
             const effectiveDist = (Math.abs(nextTargetPx - reversePx) * (1 - SLIPPAGE_PCT)) * ctVal;
@@ -762,54 +791,45 @@ async function processSymbolHedged(sym: string) {
         const currentSide = lastLeg.side;
         const nextSide = currentSide === 'long' ? 'short' : 'long';
 
-        // Check if next leg is already visible on exchange
-        let externalReversed = false;
-        if (nextSide === 'long' && liveLong > (state.legs.filter(l => l.side === 'long').reduce((acc, l) => acc + l.sz, 0))) {
-            externalReversed = true;
-        } else if (nextSide === 'short' && liveShort > (state.legs.filter(l => l.side === 'short').reduce((acc, l) => acc + l.sz, 0))) {
-            externalReversed = true;
+        // MATH FOR BOUND STRATEGY (Calculate Sz_new required for reversal):
+        const tickDecimals = state.tickDecimals;
+        const nextTargetPx = nextSide === 'long' ? state.TP_high : state.SL_low;
+        const nextStopPx = nextSide === 'long' ? state.SL_low : state.TP_high;
+
+        let pnlAtTarget = 0;
+        for (const leg of state.legs) {
+            if (leg.side === 'long') pnlAtTarget += (nextTargetPx - leg.entryPx) * leg.sz * state.ctVal;
+            else pnlAtTarget += (leg.entryPx - nextTargetPx) * leg.sz * state.ctVal;
         }
 
-        const revStatus = await checkAlgoStatus(sym, state.revAlgoId);
-        if (revStatus === 'effective' || externalReversed) {
+        let estFeesPrev = 0;
+        for (const leg of state.legs) {
+            estFeesPrev += (leg.sz * state.ctVal * leg.entryPx * FEE_PCT) * 2;
+        }
+        const targetUSDT = CLOSE_USDT_PROFIT + estFeesPrev; // Break-even + safety
+        const netNeeded = targetUSDT - pnlAtTarget;
+
+        const effectiveDist = (Math.abs(nextTargetPx - state.currentReversePx) * (1 - SLIPPAGE_PCT)) * state.ctVal;
+        const feeCostPerContract = (state.currentReversePx * FEE_PCT) * 2 * state.ctVal;
+        const sz = Math.ceil((netNeeded / (effectiveDist - feeCostPerContract)) * MATH_BUFFER);
+
+        // Await full execution of limit order before proceeding to prevent partial fill vulnerability
+        const currentSumNextSide = state.legs.filter(l => l.side === nextSide).reduce((acc, l) => acc + l.sz, 0);
+        const nextSideLive = nextSide === 'long' ? liveLong : liveShort;
+        const fullyReversed = nextSideLive >= (currentSumNextSide + sz);
+
+        if (fullyReversed) {
             if (state.legs.length >= MAX_REVERSALS) {
                 tlog(`⚠️ [${sym}] Max Reversals (${MAX_REVERSALS}) reached. No more hedging. Waiting for SL/TP.`);
                 return;
             }
-            tlog(`\n🔄 [${sym}] REVERSAL DETECTED! (Status: ${revStatus || 'external/positions'})...`);
-
-            // MATH FOR BOUND STRATEGY:
-            // Sz_new = (Target_USDT - Current_PnL_at_Target) / Distance_to_Target
-            const tickDecimals = state.tickDecimals;
-            const nextTargetPx = nextSide === 'long' ? state.TP_high : state.SL_low;
-            const nextStopPx = nextSide === 'long' ? state.SL_low : state.TP_high;
-
-            let pnlAtTarget = 0;
-            for (const leg of state.legs) {
-                if (leg.side === 'long') pnlAtTarget += (nextTargetPx - leg.entryPx) * leg.sz * state.ctVal;
-                else pnlAtTarget += (leg.entryPx - nextTargetPx) * leg.sz * state.ctVal;
-            }
-
-            const totalSzCurrently = state.legs.reduce((acc, l) => acc + l.sz, 0);
-            const estFeesPrev = (totalSzCurrently * state.ctVal * state.currentReversePx * FEE_PCT) * 2;
-            const targetUSDT = state.E_profit + CLOSE_USDT_PROFIT + estFeesPrev;
-            const netNeeded = targetUSDT - pnlAtTarget;
-
-            const effectiveDist = (Math.abs(nextTargetPx - state.currentReversePx) * (1 - SLIPPAGE_PCT)) * state.ctVal;
-            const feeCostPerContract = (state.currentReversePx * FEE_PCT) * 2 * state.ctVal;
-            const sz = Math.ceil((netNeeded / (effectiveDist - feeCostPerContract)) * MATH_BUFFER);
-
+            tlog(`\n🔄 [${sym}] REVERSAL FULLY OPENED! (Exchange Synced)...`);
             tlog(`🧪 [${sym}] Leg ${state.legs.length + 1} Sizing: NetNeeded:$${netNeeded.toFixed(2)}, Sz:${sz}`);
 
             // Update state with the new leg
             state.legs.push({ side: nextSide, entryPx: state.currentReversePx, sz });
 
-            // 1. Mandatory Protection: Close the PREVIOUS position side entirely
-            const prevSide = currentSide;
-            tlog(`🧹 [${sym}] Closing previous side (${prevSide.toUpperCase()}) to ensure direction switch.`);
-            await okxRequest('POST', '/api/v5/trade/close-position', { instId: sym, mgnMode: 'isolated', posSide: prevSide });
-
-            // 2. Re-attach hard TP/SL for the NEW position side
+            // 1. Re-attach hard TP/SL for the NEW position side
             // We use 'conditional' ordType. To close a leg, we must place an order in the opposite direction.
             // If new leg is LONG, TP is Sell at TP_high, SL is Sell at SL_low.
             const closingSide = nextSide === 'long' ? 'sell' : 'buy';
@@ -821,9 +841,21 @@ async function processSymbolHedged(sym: string) {
                 slTriggerPx: nextStopPx.toString(), slOrdPx: '-1'
             });
 
-            // 3. Calculate and Prepare NEXT reversal (Leg N+2)
+            // 2. Calculate and Prepare NEXT reversal (Leg N+2)
             const nextSideReversed = nextSide === 'long' ? 'short' : 'long';
-            const newReversePx = state.currentReversePx;
+
+            // Build the recovery corridor correctly between entry and reversal price
+            const initialLeg = state.legs[0].side;
+            let newReversePx = 0;
+            if (initialLeg === 'long') {
+                newReversePx = nextSideReversed === 'long'
+                    ? state.P0
+                    : round(state.P0 - (state.P0 * SL_PCT * REV_RATIO), state.tickDecimals);
+            } else {
+                newReversePx = nextSideReversed === 'short'
+                    ? state.P0
+                    : round(state.P0 + (state.P0 * SL_PCT * REV_RATIO), state.tickDecimals);
+            }
 
             // CALCULATE SIZE FOR NEXT LEG (so user sees it on exchange)
             // Re-run the sizing logic but for the next leg count
@@ -836,7 +868,7 @@ async function processSymbolHedged(sym: string) {
             }
             const totalSzNext = nextLegs.reduce((acc, l) => acc + l.sz, 0);
             const estFeesNext = (totalSzNext * state.ctVal * newReversePx * FEE_PCT) * 2;
-            const targetUSDTNext = state.E_profit + CLOSE_USDT_PROFIT + estFeesNext;
+            const targetUSDTNext = CLOSE_USDT_PROFIT + estFeesNext; // Break-even + safety
             const netNeededNext = targetUSDTNext - pnlAtNextTarget;
             const effectiveDistNext = (Math.abs(nextTargetPxN2 - newReversePx) * (1 - SLIPPAGE_PCT)) * state.ctVal;
             const feeCostPerContractNext = (newReversePx * FEE_PCT) * 2 * state.ctVal;
@@ -872,6 +904,7 @@ async function processSymbolHedged(sym: string) {
             activeState.mismatches[sym] = count;
             if (count < 12) {
                 tlog(`⚠️ [${sym}] Consistency Mismatch! OKX:L:${liveLong} S:${liveShort} | JSON:L:${(state.legs.filter(l => l.side === 'long').reduce((a, l) => a + l.sz, 0))} S:${(state.legs.filter(l => l.side === 'short').reduce((a, l) => a + l.sz, 0))} (${count}/12)`);
+                fs.appendFileSync('mismatch_debug.log', `[${sym}] Mismatch Info -> OKX liveLong/Short: ${liveLong}/${liveShort} | JSON: ${state.legs.filter(l => l.side === 'long').reduce((a, l) => a + l.sz, 0)}/${state.legs.filter(l => l.side === 'short').reduce((a, l) => a + l.sz, 0)}\n`);
                 return;
             } else {
                 tlog(`❌ [${sym}] Out of sync. FORCING CLOSE ALL. (Cooldown 60s)`);
@@ -892,7 +925,9 @@ async function processSymbolHedged(sym: string) {
         const feesPaidEst = (totalSz * state.ctVal * P * FEE_PCT) * 2;
         const bundlePnlNet = liveUpl - feesPaidEst;
 
-        if (bundlePnlNet >= state.E_profit + CLOSE_USDT_PROFIT) {
+        const targetRequired = state.legs.length === 1 ? (state.E_profit + CLOSE_USDT_PROFIT) : CLOSE_USDT_PROFIT;
+
+        if (bundlePnlNet >= targetRequired) {
             tlog(`\n🎉 [${sym}] Profit Net: +$${bundlePnlNet.toFixed(2)} USDT. Closing.`);
             await cancelAlgoOrder(sym, state.revAlgoId);
             await closeAllPositions(sym);
