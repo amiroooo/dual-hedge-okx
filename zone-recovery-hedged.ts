@@ -37,6 +37,7 @@ const API_LOG = 'zr-api-debug.log';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const CONFIG_FILE = 'zr-config.json';
+const MISMATCH_FILE = 'mismatch_debug.log';
 
 // ==========================================
 // 2. STATE MANAGEMENT
@@ -673,6 +674,7 @@ async function runHedgedManager() {
         if (fs.existsSync(STATE_FILE)) fs.unlinkSync(STATE_FILE);
         if (fs.existsSync(PERF_LOG)) fs.unlinkSync(PERF_LOG);
         if (fs.existsSync(API_LOG)) fs.unlinkSync(API_LOG);
+        if (fs.existsSync(MISMATCH_FILE)) fs.unlinkSync(MISMATCH_FILE);
         tlog('✅ Reset complete. Starting fresh.');
     }
 
@@ -904,7 +906,7 @@ async function processSymbolHedged(sym: string) {
             activeState.mismatches[sym] = count;
             if (count < 12) {
                 tlog(`⚠️ [${sym}] Consistency Mismatch! OKX:L:${liveLong} S:${liveShort} | JSON:L:${(state.legs.filter(l => l.side === 'long').reduce((a, l) => a + l.sz, 0))} S:${(state.legs.filter(l => l.side === 'short').reduce((a, l) => a + l.sz, 0))} (${count}/12)`);
-                fs.appendFileSync('mismatch_debug.log', `[${new Date().toISOString()}] [${sym}] Mismatch Info -> OKX liveLong/Short: ${liveLong}/${liveShort} | JSON: ${state.legs.filter(l => l.side === 'long').reduce((a, l) => a + l.sz, 0)}/${state.legs.filter(l => l.side === 'short').reduce((a, l) => a + l.sz, 0)}\n`);
+                fs.appendFileSync(MISMATCH_FILE, `[${new Date().toISOString()}] [${sym}] Mismatch Info -> OKX liveLong/Short: ${liveLong}/${liveShort} | JSON: ${state.legs.filter(l => l.side === 'long').reduce((a, l) => a + l.sz, 0)}/${state.legs.filter(l => l.side === 'short').reduce((a, l) => a + l.sz, 0)}\n`);
                 return;
             } else {
                 tlog(`❌ [${sym}] Out of sync. FORCING CLOSE ALL. (Cooldown 60s)`);
