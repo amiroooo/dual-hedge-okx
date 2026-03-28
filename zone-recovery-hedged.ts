@@ -208,7 +208,14 @@ async function okxRequest(method: string, endpoint: string, bodyObj: any = null)
         fs.appendFileSync(API_LOG, `[REST] ${new Date().toISOString()} | ${method} ${endpoint} | Req: ${bodyStr} | Res: ${JSON.stringify(response.data)}\n`);
         return response.data;
     } catch (error: any) {
-        fs.appendFileSync(API_LOG, `[REST ERR] ${new Date().toISOString()} | ${method} ${endpoint} | Req: ${bodyStr} | Err: ${error.message}\n`);
+        const errorMessage = `[REST ERR] ${new Date().toISOString()} | ${method} ${endpoint} | Req: ${bodyStr} | Err: ${error?.response?.data ? JSON.stringify(error.response.data) : error.message}\n`;
+        fs.appendFileSync(API_LOG, errorMessage);
+        terror(`❌ ${errorMessage}`);
+        if (error?.response?.data?.msg === 'Too Many Requests') {
+            tlog('Awaiting 1 minute because request failed for passing the rate limits.');
+            await new Promise(r => setTimeout(r, 61000));
+            return okxRequest(method, endpoint, bodyObj);
+        }
         if (error.code === 'ECONNABORTED') return { code: '-1', msg: 'Request timed out after 10s' };
         return { code: '-1', msg: error.response?.data?.msg || error.message };
     }
@@ -520,7 +527,7 @@ async function performGlobalCleanup() {
     }
 
     // 2. Algo / Trigger / TPSL Orders
-    const types = ['trigger', 'tpsl', 'stop', 'trailing_stop', 'move_order_stop', 'iceberg', 'twap', 'conditional', 'oco', 'price_order'];
+    const types = ['trigger', 'move_order_stop', 'iceberg', 'twap', 'conditional', 'oco'];
     for (const type of types) {
         // Broad query: all states, high limit
         const res = await okxRequest('GET', `/api/v5/trade/orders-algo-pending?ordType=${type}&limit=100`);
@@ -529,21 +536,24 @@ async function performGlobalCleanup() {
             for (const a of res.data) {
                 await okxRequest('POST', '/api/v5/trade/cancel-algos', [{
                     instId: a.instId,
-                    ordId: a.algoId,
+                    algoId: a.algoId,
                 }]);
             }
         }
     }
 
     // 3. Grid Bots (Account-wide)
-    const gridRes = await okxRequest('GET', '/api/v5/tradingBot/grid/orders-algo-pending');
-    if (gridRes && gridRes.code === '0' && gridRes.data?.length > 0) {
-        tlog(`🤖 [GLOBAL] Found ${gridRes.data.length} active Grid Bots. Stopping all...`);
-        for (const bot of gridRes.data) {
-            tlog(`🛑 Stopping Grid Bot ${bot.algoId} for ${bot.instId}...`);
-            await okxRequest('POST', '/api/v5/tradingBot/grid/stop-order-algo', {
-                algoId: bot.algoId, instId: bot.instId, algoOrdType: bot.algoOrdType, stopType: '1' // '1' means sell all assets
-            });
+    const gridTypes = ['grid', 'contract_grid'];
+    for (const gType of gridTypes) {
+        const gridRes = await okxRequest('GET', `/api/v5/tradingBot/grid/orders-algo-pending?algoOrdType=${gType}`);
+        if (gridRes && gridRes.code === '0' && gridRes.data?.length > 0) {
+            tlog(`🤖 [GLOBAL] Found ${gridRes.data.length} active Grid Bots. Stopping all...`);
+            for (const bot of gridRes.data) {
+                tlog(`🛑 Stopping Grid Bot ${bot.algoId} for ${bot.instId}...`);
+                await okxRequest('POST', '/api/v5/tradingBot/grid/stop-order-algo', {
+                    algoId: bot.algoId, instId: bot.instId, algoOrdType: bot.algoOrdType, stopType: '1' // '1' means sell all assets
+                });
+            }
         }
     }
 
@@ -558,7 +568,7 @@ async function cancelAllAlgoOrders(instId: string) {
         const orders = regRes.data.map((o: any) => ({ instId: o.instId, ordId: o.ordId }));
         await okxRequest('POST', '/api/v5/trade/cancel-batch-orders', orders);
     }
-    const types = ['trigger', 'tpsl', 'stop', 'trailing_stop', 'move_order_stop', 'iceberg', 'twap', 'conditional'];
+    const types = ['trigger', 'move_order_stop', 'iceberg', 'twap', 'conditional'];
     for (const type of types) {
         const res = await okxRequest('GET', `/api/v5/trade/orders-algo-pending?instId=${instId}&ordType=${type}`);
         if (res && res.code === '0' && res.data?.length > 0) {
@@ -568,7 +578,7 @@ async function cancelAllAlgoOrders(instId: string) {
     }
     const gridTypes = ['grid', 'contract_grid'];
     for (const gType of gridTypes) {
-        const grid = await okxRequest('GET', `/api/v5/grid/orders-algo-pending?instId=${instId}&ordType=${gType}`);
+        const grid = await okxRequest('GET', `/api/v5/tradingBot/grid/orders-algo-pending?instId=${instId}&algoOrdType=${gType}`);
         if (grid && grid.code === '0' && grid.data?.length > 0) {
             terror(`⚠️ [${instId}] ACTIVE ${gType.toUpperCase()} DETECTED!`);
         }
@@ -579,11 +589,11 @@ async function cancelAllAlgoOrders(instId: string) {
 
 async function checkAlgoStatus(instId: string, algoId: string): Promise<string | null> {
     // Check pending
-    let res = await okxRequest('GET', `/api/v5/trade/orders-algo-pending?instId=${instId}&algoId=${algoId}&algoOrdType=trigger`);
+    let res = await okxRequest('GET', `/api/v5/trade/orders-algo-pending?instId=${instId}&algoId=${algoId}&ordType=trigger`);
     if (res && res.code === '0' && res.data?.length > 0) return 'live';
 
     // Check history
-    res = await okxRequest('GET', `/api/v5/trade/orders-algo-history?instId=${instId}&algoId=${algoId}&algoOrdType=trigger`);
+    res = await okxRequest('GET', `/api/v5/trade/orders-algo-history?instId=${instId}&algoId=${algoId}&ordType=trigger`);
     if (res && res.code === '0' && res.data?.length > 0) return res.data[0].state; // 'effective', 'canceled', etc.
     return null;
 }

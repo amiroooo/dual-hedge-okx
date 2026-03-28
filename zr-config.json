@@ -36,11 +36,6 @@
       "margin": 5
     },
     {
-      "instId": "AVAX-USDT-SWAP",
-      "leverage": 5,
-      "margin": 5
-    },
-    {
       "instId": "DOT-USDT-SWAP",
       "leverage": 5,
       "margin": 5
