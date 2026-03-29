@@ -182,7 +182,7 @@ async function sendTelegramMessage(text: string) {
 // ==========================================
 // 3. OKX API HELPERS
 // ==========================================
-async function okxRequest(method: string, endpoint: string, bodyObj: any = null) {
+async function okxRequest(method: string, endpoint: string, bodyObj: any = null, retryCount = 0) {
     const timestamp = new Date().toISOString();
     const bodyStr = bodyObj ? JSON.stringify(bodyObj) : '';
     const preHash = timestamp + method.toUpperCase() + endpoint + bodyStr;
@@ -210,12 +210,15 @@ async function okxRequest(method: string, endpoint: string, bodyObj: any = null)
     } catch (error: any) {
         const errorMessage = `[REST ERR] ${new Date().toISOString()} | ${method} ${endpoint} | Req: ${bodyStr} | Err: ${error?.response?.data ? JSON.stringify(error.response.data) : error.message}\n`;
         fs.appendFileSync(API_LOG, errorMessage);
-        terror(`❌ ${errorMessage}`);
-        if (error?.response?.data?.msg === 'Too Many Requests') {
-            tlog('Awaiting 1 minute because request failed for passing the rate limits.');
-            await new Promise(r => setTimeout(r, 61000));
-            return okxRequest(method, endpoint, bodyObj);
+        
+        if (error?.response?.data?.msg === 'Too Many Requests' || error?.response?.data?.code === '50011') {
+            if (retryCount < 3) {
+                tlog(`⏳ Awaiting 1 minute (Rate Limit). Retry ${retryCount + 1}/3 for ${endpoint}`);
+                await new Promise(r => setTimeout(r, 61000));
+                return okxRequest(method, endpoint, bodyObj, retryCount + 1);
+            }
         }
+        
         if (error.code === 'ECONNABORTED') return { code: '-1', msg: 'Request timed out after 10s' };
         return { code: '-1', msg: error.response?.data?.msg || error.message };
     }
@@ -922,7 +925,12 @@ async function processSymbolHedged(sym: string) {
 
         const effectiveDist = (Math.abs(nextTargetPx - state.currentReversePx) * (1 - SLIPPAGE_PCT)) * state.ctVal;
         const feeCostPerContract = (state.currentReversePx * FEE_PCT) * 2 * state.ctVal;
-        const sz = Math.ceil((netNeeded / (effectiveDist - feeCostPerContract)) * MATH_BUFFER);
+        const denominator = (effectiveDist - feeCostPerContract);
+        let sz = 1;
+        if (denominator > 0) {
+            sz = Math.ceil((netNeeded / denominator) * MATH_BUFFER);
+        }
+        if (isNaN(sz) || sz < 1 || !isFinite(sz)) sz = 1;
 
         // Check if the reversal algo order has filled
         const currentSumNextSide = state.legs.filter(l => l.side === nextSide).reduce((acc, l) => acc + l.sz, 0);
@@ -994,7 +1002,12 @@ async function processSymbolHedged(sym: string) {
             const netNeededNext = targetUSDTNext - pnlAtNextTarget;
             const effectiveDistNext = (Math.abs(nextTargetPxN2 - newReversePx) * (1 - SLIPPAGE_PCT)) * state.ctVal;
             const feeCostPerContractNext = (newReversePx * FEE_PCT) * 2 * state.ctVal;
-            const szNext = Math.ceil((netNeededNext / (effectiveDistNext - feeCostPerContractNext)) * MATH_BUFFER);
+            const denominatorNext = (effectiveDistNext - feeCostPerContractNext);
+            let szNext = 1;
+            if (denominatorNext > 0) {
+                szNext = Math.ceil((netNeededNext / denominatorNext) * MATH_BUFFER);
+            }
+            if (isNaN(szNext) || szNext < 1 || !isFinite(szNext)) szNext = 1;
 
             tlog(`🚀 [${sym}] Preparing Log ${state.legs.length + 1} Reversal Trigger. Sz: ${szNext}`);
             const nextAlgoId = await placeTriggerOrder(sym, nextSideReversed === 'long' ? 'buy' : 'sell', nextSideReversed, newReversePx, szNext);
