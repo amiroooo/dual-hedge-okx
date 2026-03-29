@@ -504,9 +504,9 @@ async function setLeverage(instId: string, lever: number): Promise<number> {
 }
 
 async function placeTriggerOrder(instId: string, side: 'buy' | 'sell', posSide: 'long' | 'short', triggerPx: number, sz: number): Promise<string | null> {
-    tlog(`🚀 [${instId}] Placing Trigger Order (Limit): ${side.toUpperCase()} ${sz} at ${triggerPx} (posSide: ${posSide})`);
+    tlog(`🚀 [${instId}] Placing Trigger Order (Market): ${side.toUpperCase()} ${sz} at ${triggerPx} (posSide: ${posSide})`);
     const res = await okxRequest('POST', '/api/v5/trade/order-algo', {
-        instId, tdMode: 'isolated', side, posSide, ordType: 'trigger', triggerPx: triggerPx.toString(), orderPx: triggerPx.toString(), sz: sz.toString()
+        instId, tdMode: 'isolated', side, posSide, ordType: 'trigger', triggerPx: triggerPx.toString(), orderPx: '-1', sz: sz.toString()
     });
     if (res && res.code === '0' && res.data?.[0]?.algoId) return res.data[0].algoId;
     terror(`❌ [${instId}] Trigger Order failed:`, res.msg || res.data?.[0]?.sMsg);
@@ -967,7 +967,7 @@ async function processSymbolHedged(sym: string) {
             tlog(`🛡️ [${sym}] Attaching Hard TP/SL to ${nextSide.toUpperCase()} leg (Sz: ${actualSz})...`);
             await okxRequest('POST', '/api/v5/trade/order-algo', {
                 instId: sym, tdMode: 'isolated', posSide: nextSide, side: closingSide,
-                ordType: 'conditional', sz: actualSz.toString(),
+                ordType: 'oco', sz: actualSz.toString(),
                 tpTriggerPx: nextTargetPx.toString(), tpOrdPx: '-1',
                 slTriggerPx: nextStopPx.toString(), slOrdPx: '-1'
             });
