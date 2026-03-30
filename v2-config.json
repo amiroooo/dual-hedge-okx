@@ -2,26 +2,26 @@
   "BTC-USDT-SWAP": {
     "enabled": true,
     "maxMargin": 250,
-    "extraMarginPct": 0.3,
-    "rangePct": 0.2,
+    "extraMarginPct": 0.30,
+    "rangePct": 0.20,
     "profitTargetPct": 0.03,
     "leverage": 10,
     "totalProfit": 0
   },
   "ETH-USDT-SWAP": {
     "enabled": false,
-    "maxMargin": 500,
-    "extraMarginPct": 0.3,
-    "rangePct": 0.2,
+    "maxMargin": 50000,
+    "extraMarginPct": 0.30,
+    "rangePct": 0.20,
     "profitTargetPct": 0.03,
-    "leverage": 5,
+    "leverage": 10,
     "totalProfit": 0
   },
   "SOL-USDT-SWAP": {
     "enabled": false,
-    "maxMargin": 300,
-    "extraMarginPct": 0.4,
-    "rangePct": 0.2,
+    "maxMargin": 30000,
+    "extraMarginPct": 0.40,
+    "rangePct": 0.20,
     "profitTargetPct": 0.03,
     "leverage": 5,
     "totalProfit": 0

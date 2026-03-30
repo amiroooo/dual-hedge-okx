@@ -199,13 +199,23 @@ async function main() {
 
                 const { gridNum, netProfitUsdt } = optimizeGridNum((state.baseMargin * (2 / 3)) * config.leverage, parseFloat(minPx), parseFloat(maxPx));
 
+                const p_num = parseFloat(p.toString());
+                const maxPx_num = parseFloat(maxPx);
+                const minPx_num = parseFloat(minPx);
+                const gridRange = maxPx_num - minPx_num;
+                const bufferDistance = gridRange * 0.02;
+
                 const create = async (dir: 'long' | 'short') => {
+                    const sl = dir === 'long' ? (minPx_num - bufferDistance).toFixed(tickDecimals) : (maxPx_num + bufferDistance).toFixed(tickDecimals);
+                    const tp = dir === 'long' ? (maxPx_num + bufferDistance).toFixed(tickDecimals) : (minPx_num - bufferDistance).toFixed(tickDecimals);
+
                     const payload = {
                         instId: symbol, algoOrdType: 'contract_grid',
                         maxPx, minPx, gridNum: gridNum.toString(), runType: '2',
                         direction: dir, lever: config.leverage.toString(), sz: state.baseMargin.toFixed(2),
                         tdMode: 'isolated',
-                        slTriggerPx: dir === 'long' ? (p * (1 - config.rangePct * 1.1)).toFixed(tickDecimals) : (p * (1 + config.rangePct * 1.1)).toFixed(tickDecimals),
+                        slTriggerPx: sl,
+                        tpTriggerPx: tp
                     };
                     const res = await okxRequest('POST', '/api/v5/tradingBot/grid/order-algo', payload);
                     if (res.code !== '0') return null;
@@ -222,8 +232,15 @@ async function main() {
                 state.longAlgoId = await create('long');
                 state.shortAlgoId = await create('short');
                 if (state.longAlgoId) {
+                    const gridRange = parseFloat(maxPx) - parseFloat(minPx);
+                    const bufferDistance = gridRange * 0.02;
+                    const lSL = (parseFloat(minPx) - bufferDistance).toFixed(tickDecimals);
+                    const lTP = (parseFloat(maxPx) + bufferDistance).toFixed(tickDecimals);
+                    const sSL = (parseFloat(maxPx) + bufferDistance).toFixed(tickDecimals);
+                    const sTP = (parseFloat(minPx) - bufferDistance).toFixed(tickDecimals);
+
                     console.log(`✅ ${symbol} Dual-Grid Active.`);
-                    await sendTelegram(`🚀 <b>Dual-Grid Deployed: ${symbol}</b>\n🔹 Leverage: ${config.leverage}x\n🔹 Total Margin: $${totalTargetPerBot.toFixed(2)}\n🔹 Range: ${config.rangePct * 100}%\n🔹 Grids: ${gridNum} ($${netProfitUsdt.toFixed(2)}/step)`);
+                    await sendTelegram(`🚀 <b>Dual-Grid Deployed: ${symbol}</b>\n🔹 Leverage: ${config.leverage}x\n🔹 Total Margin: $${totalTargetPerBot.toFixed(2)}\n🔹 Range: ${config.rangePct * 100}%\n🔹 Grids: ${gridNum} ($${netProfitUsdt.toFixed(2)}/step)\n\n🛡 <b>Safety Limits:</b>\n📊 Long: SL ${lSL} | TP ${lTP}\n📊 Short: SL ${sSL} | TP ${sTP}`);
                 }
             }
 
