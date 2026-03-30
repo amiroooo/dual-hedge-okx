@@ -11,17 +11,17 @@
   },
   "ETH-USDT-SWAP": {
     "enabled": false,
-    "maxMargin": 50000,
+    "maxMargin": 250,
     "extraMarginPct": 0.30,
     "rangePct": 0.20,
     "profitTargetPct": 0.03,
-    "minProfitUsdt": 30,
+    "minProfitUsdt": 10,
     "leverage": 10,
     "totalProfit": 0
   },
   "SOL-USDT-SWAP": {
     "enabled": false,
-    "maxMargin": 30000,
+    "maxMargin": 250,
     "extraMarginPct": 0.40,
     "rangePct": 0.20,
     "profitTargetPct": 0.03,
