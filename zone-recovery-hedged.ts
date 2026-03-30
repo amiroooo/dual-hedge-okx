@@ -23,6 +23,7 @@ const LEVERAGE = Number(process.env.ZR_LEVERAGE) || 5;
 const TP_PCT = Number(process.env.ZR_TP_PCT) || 0.01;
 const SL_PCT = Number(process.env.ZR_SL_PCT) || 0.02; // New SL Distance
 const REV_RATIO = 0.6; // Reversal at 60% (Less frequent, balanced size)
+const AGGRESSION_PCT = Number(process.env.ZR_AGGRESSION_PCT) || 0.5; // Dampen Leg 3+
 const MAX_REVERSALS = Number(process.env.ZR_MAX_REVERSALS) || 5;
 const POLL_INTERVAL_MS = Number(process.env.ZR_POLL_INTERVAL_MS) || 5000;
 const CLOSE_USDT_PROFIT = Number(process.env.ZR_CLOSE_USDT_PROFIT) || 1.0;
@@ -928,7 +929,9 @@ async function processSymbolHedged(sym: string) {
         const denominator = (effectiveDist - feeCostPerContract);
         let sz = 1;
         if (denominator > 0) {
-            sz = Math.ceil((netNeeded / denominator) * MATH_BUFFER);
+            let reqSz = (netNeeded / denominator) * MATH_BUFFER;
+            if (state.legs.length >= 2) reqSz *= AGGRESSION_PCT;
+            sz = Math.ceil(reqSz);
         }
         if (isNaN(sz) || sz < 1 || !isFinite(sz)) sz = 1;
 
@@ -1005,7 +1008,9 @@ async function processSymbolHedged(sym: string) {
             const denominatorNext = (effectiveDistNext - feeCostPerContractNext);
             let szNext = 1;
             if (denominatorNext > 0) {
-                szNext = Math.ceil((netNeededNext / denominatorNext) * MATH_BUFFER);
+                let reqSzNext = (netNeededNext / denominatorNext) * MATH_BUFFER;
+                if (state.legs.length >= 2) reqSzNext *= AGGRESSION_PCT;
+                szNext = Math.ceil(reqSzNext);
             }
             if (isNaN(szNext) || szNext < 1 || !isFinite(szNext)) szNext = 1;
 

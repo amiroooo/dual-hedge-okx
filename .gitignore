@@ -4,3 +4,4 @@ node_modules/*
 zr-hedged-performance.json
 .zr-hedged-state.json
 .gap-v2-state.json
+*.csv
