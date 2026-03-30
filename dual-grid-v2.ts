@@ -252,7 +252,7 @@ async function main() {
             const totalGridProfit = pnlL.realized + pnlS.realized;
 
             const currentPairTotalMargin = state.baseMargin / (1 - config.extraMarginPct);
-            const target = Math.max(30, currentPairTotalMargin * config.profitTargetPct);
+            const target = Math.max(config.minProfitUsdt || 30, currentPairTotalMargin * config.profitTargetPct);
 
             // Update state for Dashboard
             state.lastTotalPnl = totalPnl;
